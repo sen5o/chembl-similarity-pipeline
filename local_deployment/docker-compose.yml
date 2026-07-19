@@ -1,0 +1,103 @@
+# Local deployment: Postgres (Airflow metadata + DWH) + Airflow 3 (LocalExecutor).
+# LocalExecutor is deliberate: single-host, no redis/celery/worker to manage.
+#
+# NOTE: pin AIRFLOW_IMAGE_NAME to the version you developed against (memory: 3.2).
+# Verify service names against the official Airflow 3 compose for your patch level.
+
+x-airflow-common: &airflow-common
+  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:3.0.0}
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    # Airflow 3 runs tasks via the Task Execution API. Default is http://localhost:8080,
+    # which inside the scheduler container is its own loopback, NOT the api-server
+    # container -> tasks fail with "Connection refused" before any code runs. Point it
+    # at the api-server service name.
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    # The scheduler signs each task's JWT and the api-server validates it. If unset,
+    # each container generates its own secret -> "Invalid auth token: Signature
+    # verification failed". Must be identical across components; the shared anchor
+    # guarantees that. Fine to hardcode for local dev.
+    AIRFLOW__API_AUTH__JWT_SECRET: local-dev-shared-jwt-secret-not-for-prod
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    # Airflow 3 default auth: SimpleAuthManager. Define an admin user (username:role);
+    # its password is auto-generated and printed in the api-server logs on first boot.
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "admin:admin"
+    TEAMS_WEBHOOK_URL: ${TEAMS_WEBHOOK_URL:-}
+  volumes:
+    - ../dags:/opt/airflow/dags
+    - airflow-logs:/opt/airflow/logs
+  depends_on: &airflow-deps
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-dwh-db.sql:/docker-entrypoint-initdb.d/00_create_dwh_db.sql:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 5
+    ports:
+      - "5432:5432"
+
+  # Applies DWH DDL migrations (01, 02, 03) to the `dwh` database, in order.
+  migrate:
+    image: postgres:16
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: airflow
+    volumes:
+      - ./migrations:/migrations:ro
+    entrypoint: >
+      bash -c "for f in /migrations/*.sql; do
+        echo \"applying $$f\"; psql -h postgres -U airflow -d dwh -f \"$$f\" || exit 1;
+      done"
+
+  airflow-init:
+    <<: *airflow-common
+    # Airflow 3 defaults to SimpleAuthManager; `airflow users create` is a FAB-only
+    # command and does not exist here. Metadata init is all that's needed; the admin
+    # password is auto-generated and printed in the api-server logs on first start.
+    entrypoint: >
+      bash -c "airflow db migrate"
+    depends_on: *airflow-deps
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-data:
+  airflow-logs:
