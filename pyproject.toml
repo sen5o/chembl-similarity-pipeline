@@ -1,0 +1,25 @@
+# Root dev-tooling config only. Each task under tasks/* has its own pyproject.toml
+# with its runtime dependencies (container-per-task isolation).
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["migrations", "logs"]
+
+[tool.ruff.lint]
+# pycodestyle, pyflakes, isort, bugbear, pyupgrade
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.11"
+# Libraries like rdkit, pyarrow, boto3 ship without type stubs. Without this,
+# mypy floods you with "library has no stubs" noise unrelated to your code.
+ignore_missing_imports = true
+# Pragmatic baseline for a learning project — not full strict mode.
+warn_unused_ignores = true
+warn_redundant_casts = true
+check_untyped_defs = true
+exclude = ["migrations", "logs"]
