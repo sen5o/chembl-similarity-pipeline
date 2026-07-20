@@ -19,6 +19,7 @@ from gen import services
 def _env(monkeypatch):
     monkeypatch.setenv("CHEMBL_RELEASE", "37")
     monkeypatch.setenv("DE_SCHOOL_S3_BUCKET", "test-bucket")
+    monkeypatch.setenv("DWH_DSN", "postgresql://u:p@localhost:5432/dwh")
 
 
 def test_acquire_chembl_skips_download_on_cache_hit():
@@ -72,3 +73,17 @@ def test_success_marker_written_only_after_all_tables_uploaded():
         services.acquire_chembl()
 
     write_marker.assert_not_called()
+
+
+def test_load_staging_downloads_and_copies_every_table():
+    with (
+        patch.object(services.repository, "download_file") as download_file,
+        patch.object(services.repository, "truncate_and_copy", return_value=42) as copy,
+    ):
+        counts = services.load_staging()
+
+    # one download + one copy per table — no table skipped
+    assert download_file.call_count == len(services.TABLE_COLUMNS)
+    assert copy.call_count == len(services.TABLE_COLUMNS)
+    assert set(counts) == set(services.TABLE_COLUMNS)
+    assert all(n == 42 for n in counts.values())
