@@ -1,0 +1,4 @@
+compound_id,compound_name,molecular_weight,ic50_nm,assay_date,lab_id
+CPD-043,,284.74,920.0,2024-01-23,LAB-F
+CPD-044,Quetiapine,383.51,340.0,2024-01-23,LAB-F
+CPD-053,Bupropion,N/A,490.0,2024-01-25,LAB-G
