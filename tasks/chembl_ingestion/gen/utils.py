@@ -65,3 +65,27 @@ def bronze_chembl_prefix(release: str) -> str:
     path = f"bronze/chembl/release={release}"
     root = s3_root_prefix()
     return f"{root}/{path}" if root else path
+
+
+def table_parquet_key(prefix: str, table: str) -> str:
+    """S3 key of a table's parquet under a bronze prefix.
+
+    Single source of truth for the per-table file name, shared by the write
+    side (acquire) and the read side (load_staging) so they can never drift.
+    """
+    return f"{prefix}/{table}/part-000.parquet"
+
+
+def dwh_dsn() -> str:
+    """Postgres connection string for the DWH (staging + core schemas).
+
+    Read from DWH_DSN, e.g.
+        postgresql://airflow:airflow@postgres:5432/dwh   (inside Airflow)
+        postgresql://airflow:airflow@localhost:5432/dwh  (manual local run)
+    """
+    dsn = os.environ.get("DWH_DSN")
+    if not dsn:
+        raise RuntimeError(
+            "DWH_DSN is not set, e.g. postgresql://airflow:airflow@localhost:5432/dwh"
+        )
+    return dsn
