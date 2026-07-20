@@ -167,7 +167,7 @@ def acquire_chembl() -> str:
             schema = TABLE_SCHEMAS[table]
             row_count = repository.extract_table(sqlite_path, table, schema, dest)
 
-            key = f"{prefix}/{table}/part-000.parquet"
+            key = utils.table_parquet_key(prefix, table)
             repository.upload_file(dest, bucket, key)
 
             manifest["tables"][table] = {"rows": row_count, "columns": columns}
@@ -179,3 +179,31 @@ def acquire_chembl() -> str:
 
     log.info("acquire_chembl complete for release %s", release)
     return prefix
+
+
+def load_staging() -> dict[str, int]:
+    """Load the Bronze parquet from S3 into staging.* in Postgres.
+
+    Reads from the same release/prefix acquire_chembl wrote to, and loads
+    each of the 4 tables via TRUNCATE + COPY (full refresh — README ADR 3:
+    monolithic release dump, no incremental merge). Returns per-table row
+    counts. Assumes acquire_chembl has already run for this release (its
+    `_SUCCESS` marker is the contract); we don't re-check it here so the two
+    tasks stay independently runnable.
+    """
+    release = utils.get_release()
+    bucket = utils.s3_bucket()
+    prefix = utils.bronze_chembl_prefix(release)
+    dsn = utils.dwh_dsn()
+
+    counts: dict[str, int] = {}
+    with TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        for table, columns in TABLE_COLUMNS.items():
+            key = utils.table_parquet_key(prefix, table)
+            local = tmp_dir / f"{table}.parquet"
+            repository.download_file(bucket, key, local)
+            counts[table] = repository.truncate_and_copy(dsn, table, local, columns)
+
+    log.info("load_staging complete for release %s: %s", release, counts)
+    return counts

@@ -68,6 +68,65 @@ def upload_file(local_path: Path, bucket: str, key: str) -> None:
     log.info("Uploaded %s -> s3://%s/%s", local_path, bucket, key)
 
 
+def download_file(bucket: str, key: str, dest: Path) -> Path:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    s3 = boto3.client("s3")
+    s3.download_file(bucket, key, str(dest))
+    log.info("Downloaded s3://%s/%s -> %s", bucket, key, dest)
+    return dest
+
+
+# --------------------------------------------------------------------------
+# Postgres — staging load (TRUNCATE + COPY FROM STDIN)
+# --------------------------------------------------------------------------
+
+
+def truncate_and_copy(
+    dsn: str,
+    table: str,
+    parquet_path: Path,
+    columns: list[str],
+    batch_size: int = 100_000,
+) -> int:
+    """Full-refresh load: TRUNCATE staging.<table>, then stream the parquet
+    into it via COPY FROM STDIN. Both happen in one transaction, so a failed
+    COPY rolls the TRUNCATE back — staging is never left empty on error.
+
+    Streams the parquet in record batches and feeds each as CSV to COPY, so
+    memory stays bounded even for chembl_id_lookup (~5.4M rows). CSV is used
+    with `NULL ''`: pyarrow writes real strings quoted (empty string -> "")
+    and nulls as bare empty, so the two remain distinguishable (verified).
+
+    Returns rows copied.
+    """
+    import io
+
+    import psycopg2
+    import pyarrow.csv as pacsv
+
+    col_list = ", ".join(columns)
+    copy_sql = f"COPY staging.{table} ({col_list}) FROM STDIN WITH (FORMAT csv, NULL '')"
+
+    parquet_file = pq.ParquetFile(parquet_path)
+    total = 0
+    conn = psycopg2.connect(dsn)
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(f"TRUNCATE staging.{table}")
+            for batch in parquet_file.iter_batches(batch_size=batch_size):
+                buf = io.BytesIO()
+                pacsv.write_csv(batch, buf, write_options=pacsv.WriteOptions(include_header=False))
+                buf.seek(0)
+                cur.copy_expert(copy_sql, buf)
+                total += batch.num_rows
+        # `with conn` commits on success / rolls back on exception
+    finally:
+        conn.close()
+
+    log.info("Loaded %s rows into staging.%s", total, table)
+    return total
+
+
 # --------------------------------------------------------------------------
 # ChEMBL dump acquisition (EBI release, via chembl_downloader)
 # --------------------------------------------------------------------------
