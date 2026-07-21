@@ -1,327 +1,307 @@
 # ChEMBL Molecular Similarity Pipeline
 
 An end-to-end data engineering pipeline that, for a set of input compounds, finds the
-**top-10 most structurally similar molecules** across the entire ChEMBL database, and
-serves the results through a dimensional data mart.
+**top-10 most structurally similar molecules** across the ChEMBL database, and serves the
+results through a dimensional data mart.
 
 Built with **Airflow 3**, **PostgreSQL**, **AWS S3**, and **RDKit**, deployed locally via
 `docker-compose`.
+
+> **Status.** Built and verified end-to-end on real data: ChEMBL ingestion (Bronze) and source
+> resolution (Silver). Pending: fingerprint generation, similarity computation, DWH load, and
+> analytical views. See §13 for the full status table.
 
 ---
 
 ## 1. What it does
 
-1. Ingests four ChEMBL tables (the full compound universe, ~2.4M molecules with structures).
+1. Ingests four ChEMBL tables (the full compound universe, ~2.5M molecules).
 2. Resolves the input compound names → ChEMBL IDs, applying data-quality rules.
 3. Computes **Morgan fingerprints** (radius 2, 2048 bits) for every ChEMBL structure.
 4. Computes **Tanimoto similarity** of each input compound against the full corpus.
 5. Selects the top-10 neighbours per compound, flagging boundary ties.
 6. Loads a **star schema** (`dim_molecule` + `fact_similarity`) and exposes analytical views.
 
-The input set is **all valid, unique, resolved compounds** from `input/surname_name/`
-(confirmed with the mentor — the "100 molecules" figure in the brief is illustrative).
+The source set is **all valid, unique, resolved compounds** from the input folder — confirmed
+with the mentor. The brief's "100 chosen molecules" is illustrative; nothing hardcodes a
+molecule count.
 
 ---
 
-## 2. Architecture
+## 2. ChEMBL release: pinned to 35
 
-The pipeline follows a **medallion** approach. The grading brief requires justifying the
-layer choice, so the reasoning is made explicit below.
+The pipeline is pinned to **ChEMBL 35** via `CHEMBL_RELEASE`, not the latest release. The brief
+(6a) requires `cx_logp` and `molecular_species` in the dimension table. These ChemAxon-computed
+properties existed only through ChEMBL 35 and were removed afterwards (verified: both are absent
+from the entire release-37 dump, checked across all tables). Release 35 is the most recent
+release that still contains both. Ingestion is release-keyed end to end (`.../release=35/…`), so
+switching releases is a single variable change and re-runs are idempotent.
+
+---
+
+## 3. Architecture
+
+A **medallion** design. The two mandatory DWH layers are the Postgres schemas `staging` (Bronze)
+and `core` (Gold); the Silver tier is an S3 data-lake tier holding intermediate artifacts. This
+is the honest description — Silver is an artifact store, not warehouse tables.
 
 ```
-        INPUT                         BRONZE                    SILVER (S3 lake)                GOLD
-  ┌───────────────┐          ┌──────────────────────┐   ┌──────────────────────────┐   ┌────────────────┐
-  │ ChEMBL dump   │────────▶ │ staging.* (4 tables) │──▶│ corpus  (curated smiles) │──▶│ core           │
-  │ (EBI FTP)     │          │  native types        │   │ fingerprints             │   │  dim_molecule  │
-  ├───────────────┤          ├──────────────────────┤   │ similarity (per source)  │──▶│  fact_similarity│
-  │ batch CSVs    │────────▶ │ input_raw (TEXT)     │──▶│ source_set               │   │  + views        │
-  └───────────────┘          └──────────────────────┘   │  {resolved,quarantine}   │   └────────────────┘
-                                                         └──────────────────────────┘
+        INPUT                    BRONZE                     SILVER (S3)                  GOLD
+  input: ChEMBL dump (rel 35) + batch CSVs
+    -> staging.* (native types) + input (TEXT)
+      -> source_set {resolved, quarantine}  [built]
+         fingerprints / similarity          [pending]
+           -> core: dim_molecule + fact_similarity + views  [pending]
 ```
-
-### Layers
 
 | Tier | Where it lives | Contents | Why a separate layer |
 |------|----------------|----------|----------------------|
-| **Bronze** | Postgres `staging` schema + `s3://…/bronze/` | Raw ChEMBL tables + raw batch CSVs | Isolates raw data; ingestion is repeatable without re-download |
-| **Silver** | `s3://…/silver/` (Parquet) | Curated `corpus`, resolved `source_set`, `fingerprints`, `similarity` | Heavy compute artifacts kept out of the database; reusable and versioned |
-| **Gold** | Postgres `core` schema | Star schema + analytical views | Business-ready; contains only molecules referenced by facts |
+| **Bronze** | Postgres `staging` + `s3://…/bronze/` | Raw ChEMBL tables + raw batch CSVs | Isolates raw data; ingestion repeatable without re-download |
+| **Silver** | `s3://…/silver/` (Parquet) | Resolved `source_set`, fingerprints, similarity | Heavy compute kept out of the DB; reusable, versioned |
+| **Gold** | Postgres `core` | Star schema + views | Business-ready; only molecules referenced by facts |
 
-**Justification of the "at least 2 layers" requirement.**
-The two mandatory DWH layers are the Postgres schemas `staging` (Bronze) and `core` (Gold).
-The Silver tier is an S3 **data-lake tier** holding intermediate compute artifacts
-(fingerprints, per-molecule similarity tables). We deliberately do **not** call this a
-"three-schema warehouse" — the Silver tier is an artifact store, not a set of DWH tables.
-This is the honest description of the design.
+### Staging types — by origin, not one rule
 
-### A note on staging types
+- **Batch CSVs** land as `TEXT` — external, dirty data must be quarantined, not fail the load.
+- **ChEMBL tables** keep **native types** — ChEMBL is a curated relational source.
 
-Bronze uses **two different strategies by origin, not one blanket rule**:
+Bronze keeps **all rows, needed columns only**: projection is a storage decision; row filtering
+(`entity_type`, non-`OBSOLETE`, has-structure) is semantic and applied downstream, at the
+fingerprint stage.
 
-- **Batch CSVs** land as `TEXT`/`VARCHAR` — they are external and dirty, so typing at the
-  boundary would turn a bad row into a task failure instead of a quarantined record.
-- **ChEMBL tables** keep their **native types** — ChEMBL is a curated relational source with
-  its own schema; forcing TEXT onto it would be pointless.
-
-### Bronze = all rows, needed columns only
-
-Projection (dropping unused columns) is a storage decision and is applied in Bronze.
-Selection (dropping rows, e.g. `entity_type='COMPOUND'`, non-`OBSOLETE`) is a **semantic**
-decision and is deferred to Silver's `corpus` build. Bronze stays a faithful copy.
-
----
-
-## 3. Project structure
+### S3 layout (under `final_task/hovhannes_karapetian/`)
 
 ```
-.
-├── README.md                          # launch/usage + example results (brief step 9)
-├── dags/
-│   ├── similarity_pipeline.py         # DAG: orchestrates task-containers
-│   └── callbacks.py                   # on_failure → Teams (Power Automate Adaptive Card)
-├── tasks/
-│   ├── chembl_ingestion/              # step 1: 4 ChEMBL tables → STAGING/S3 → silver/corpus
-│   │   ├── Dockerfile
-│   │   ├── gen/{__init__,repository,services,utils}.py
-│   │   ├── pyproject.toml · requirements.txt · run.py
-│   │   └── tests/{fixtures/, test_service.py}
-│   │
-│   ├── source_resolution/             # DQ + name→chembl_id resolution
-│   │   ├── gen/
-│   │   │   ├── file_parser.py
-│   │   │   ├── parser_factory.py      # routes valid vs invalid rows
-│   │   │   ├── validators.py          # empty name, ic50<=0, schema drift
-│   │   │   ├── resolver.py            # ChEMBL lookup + molecular-weight cross-check
-│   │   │   ├── repository.py · services.py · utils.py
-│   │   └── tests/
-│   │       ├── fixtures/{valid_batch_001.csv, batch_004.csv}
-│   │       └── {test_parsers, test_validators, test_resolver}.py
-│   │
-│   ├── fingerprint_generation/        # step 2: Morgan(2,2048) of all structures → S3
-│   │   ├── gen/{fingerprints,molecule_parser,repository,services,utils}.py
-│   │   └── tests/test_fingerprints.py
-│   │
-│   ├── similarity_computation/        # steps 3-5: Tanimoto → parquet → S3 → top-10 + flag
-│   │   ├── gen/
-│   │   │   ├── similarity.py          # BulkTanimotoSimilarity
-│   │   │   ├── ranking.py             # top-10 + has_duplicates_of_last_largest_score
-│   │   │   ├── repository.py · services.py · utils.py
-│   │   └── tests/{test_similarity, test_ranking}.py
-│   │
-│   └── dwh_load/                      # step 6: parquet → STAGING → CORE (dim/fact)
-│       ├── gen/{repository,services,utils}.py
-│       └── tests/
-│
-└── local_deployment/
-    ├── docker-compose.yml             # Postgres (DWH + Airflow meta) + web/scheduler/worker
-    ├── migrations/                    # DDL as migrations
-    │   ├── 01_staging.sql             # chembl staging (native) + input staging (TEXT)
-    │   ├── 02_core_star_schema.sql    # dim_molecule, fact_similarity
-    │   └── 03_views.sql               # 7a, 7b, 8a, 8b, 8c (applied at deploy)
-    └── fixtures/                      # e2e mini-corpus + real batch CSVs
+bronze/chembl/release=35/{compound_structures,molecule_dictionary,
+                          compound_properties,chembl_id_lookup}/*.parquet + _SUCCESS
+silver/source_set/{resolved,quarantine}.parquet
 ```
 
-Each `tasks/*` folder is an independently containerised unit with its own dependencies,
-invoked by the DAG. Views are created by migration `03_views.sql` at deploy time; the DAG
-does not build them.
+Input CSVs live separately under `input/hovhannes-karapetian/` (input path uses a hyphen; the
+output prefix uses an underscore).
 
 ---
 
 ## 4. Data model (star schema)
 
-**`dim_molecule`** — one row per molecule referenced by any fact (both sources and targets).
+**`dim_molecule`** — one row per molecule referenced by any fact (sources and targets).
 
 | Column | Source |
 |--------|--------|
 | `molecule_key` (surrogate PK) | generated |
 | `chembl_id` (business key) | ChEMBL |
 | `molecule_type` | `molecule_dictionary` |
-| `mw_freebase`, `alogp`, `psa`, `cx_logp`, `molecular_species`, `full_mwt`, `aromatic_rings`, `heavy_atoms` | `compound_properties` |
+| `mw_freebase, alogp, psa, cx_logp, molecular_species, full_mwt, aromatic_rings, heavy_atoms` | `compound_properties` |
 
-Loaded as **SCD Type 1** — molecular properties are static reference data, so history is not
-tracked. A surrogate key is used because ChEMBL merges molecules and marks IDs `OBSOLETE`
-(`chembl_id_lookup.status`), so `chembl_id` is not guaranteed immutable.
+**SCD Type 1** — molecular properties are static reference data. A surrogate key is used because
+ChEMBL merges molecules and marks IDs `OBSOLETE`, so `chembl_id` is not immutable.
 
-**`fact_similarity`** — grain: one row per (source, target-in-top-10) pair.
-
-| Column | Meaning |
-|--------|---------|
-| `source_molecule_key` (FK) | the query molecule |
-| `target_molecule_key` (FK) | a similar molecule |
-| `tanimoto_score` | similarity |
-| `has_duplicates_of_last_largest_score` | boundary-tie flag |
-
-Invariant used in tests: `count(fact_similarity) == N_sources × 10`.
+**`fact_similarity`** — grain: one row per (source, target-in-top-10) pair:
+`source_molecule_key`, `target_molecule_key`, `tanimoto_score`,
+`has_duplicates_of_last_largest_score`. Test invariant: `count = N_sources × 10`.
 
 ---
 
-## 5. Pipeline stages
+## 5. Data quality & name resolution
 
-| Stage | Task container | Brief step |
-|-------|----------------|-----------|
-| Acquire ChEMBL dump → staging → `silver/corpus` | `chembl_ingestion` | 1 |
-| Resolve names → chembl_id, apply DQ | `source_resolution` | — |
-| Morgan fingerprints for full corpus → S3 | `fingerprint_generation` | 2 |
-| Tanimoto vs corpus → full table per source → S3 | `similarity_computation` | 3, 4 |
-| Top-10 + tie flag | `similarity_computation` | 5 |
-| Load `dim_molecule` + `fact_similarity` | `dwh_load` | 6 |
-| Views | migration `03_views.sql` | 7, 8 |
-
-`source_resolution` and `fingerprint_generation` depend only on ingestion and are independent
-of each other. `similarity_computation` depends on both.
-
-### Similarity design notes
-
-- **Fingerprints** are the only real cost (~2.4M molecules). Parallelised via task mapping
-  (for retry granularity) plus an in-process `multiprocessing.Pool` (for actual cores).
-- **Similarity** is a single streaming task: the ~58 source fingerprints fit in memory; the
-  corpus is streamed in chunks in a single pass. `BulkTanimotoSimilarity` is fast (~seconds),
-  so distributing it would cost more in orchestration overhead than it saves.
-- **Ranking reads the full similarity table** per source. The tie flag needs the complete
-  count of molecules at the 10th-place score; a distributed partial top-K would silently
-  undercount ties.
-- The full per-molecule similarity table (required by step 4) is retained as the **evidence
-  base** that makes the tie flag verifiable.
-
----
-
-## 6. Data quality
-
-**Principle: reject only on fields we consume.** A source row exists to yield a `chembl_id`
-that has a structure. IC50 is never used downstream, so a corrupt IC50 cannot justify a reject.
+**Principle: reject only on fields we consume.** A source row exists to yield a `chembl_id` that
+has a structure. IC50 is never used downstream, so a corrupt IC50 is a WARN (kept), not a
+reject — per the mentor's ruling.
 
 | Outcome | Condition | Destination |
 |---------|-----------|-------------|
-| REJECT | empty / missing name | `quarantine.parquet` |
-| REJECT | name unresolved (all tiers) | `quarantine.parquet` |
-| REJECT | ambiguous, MW cannot disambiguate | `quarantine.parquet` |
-| REJECT | no `canonical_smiles` in ChEMBL | `quarantine.parquet` |
-| REJECT | MW mismatch (gross) | `quarantine.parquet` |
-| WARN | `ic50 <= 0` / non-numeric / empty | `resolved.parquet` + `dq_flags` |
-| WARN | MW mismatch (within tolerance) | `resolved.parquet` + `dq_flags` |
-| WARN | resolved via a lower-confidence tier | `resolved.parquet` + `dq_flags` |
-| WARN | duplicate name across batches | collapsed + `dq_flags` |
+| REJECT | empty/missing name, or file with no name column | `quarantine.parquet` |
+| REJECT | name unresolved / ambiguous / no structure / gross MW mismatch | `quarantine.parquet` |
+| WARN | `ic50 <= 0` or non-numeric; MW unavailable; low-confidence resolution | `resolved.parquet` + `dq_flags` |
 
-Per the mentor's guidance, a corrupt IC50 on an otherwise real compound (e.g. Haloperidol)
-is **kept and flagged**, not dropped. DQ flags live in the Silver `source_set` (grain = input
-row), not in the warehouse (grain = molecule). Deduplication is by `chembl_id`, **after**
-resolution, merging the `dq_flags` of collapsed rows.
+The parser maps columns to canonical fields by name (case-insensitive, synonym-aware), not by
+position or count, and tolerates BOM, whitespace, quoting, ragged rows, and `N/A` without
+crashing — robust to arbitrary input. DQ flags live in the Silver `source_set` (grain = input
+row), not the warehouse (grain = molecule). Dedup is by `chembl_id`, after resolution, merging
+the `dq_flags` of collapsed rows.
 
-### Name resolution (strategy chain)
+### Resolver — strategy chain
 
-| Tier | Method | Cost |
-|------|--------|------|
-| 1 | exact match on normalised `pref_name` (local) | none |
-| 2 | strip salt/ester suffix → parent → validate against `mw_freebase` | none |
-| 3 | ChEMBL REST point-lookup on the remainder, cached to Silver | ~5–10 calls |
-| 4 | quarantine with an explicit reason | — |
+| Tier | Method | Status |
+|------|--------|--------|
+| 1 | exact match on normalised `pref_name` | **active** |
+| 2 | salt/ester suffix → parent, MW-verified | deferred (extension seam in `resolver.py`) |
+| 3 | ChEMBL API synonym lookup (e.g. Paracetamol→Acetaminophen) | deferred (extension seam) |
+| 4 | quarantine with an explicit reason | active |
 
-The REST API is used only as a control plane (release/status) and for a handful of point
-lookups — never as the bulk data plane. Bulk ingestion is done from the release dump.
+Molecular weight is a **verifier, never a selector**: name leads, MW confirms or disambiguates.
+A candidate is accepted only if it has a structure and its `mw_freebase`/`full_mwt` is within
+`max(0.5 Da, 1%)` of the input weight. Multiple name matches are disambiguated by MW; if MW
+can't pick one, the row is quarantined as `ambiguous` rather than guessed. Tier 2 and Tier 3 are
+deferred (current input has no salts, and the one synonym miss is Paracetamol); both slot into
+the chain later without rework, and any unresolved salt/synonym quarantines cleanly.
+
+### DQ gate
+
+Metrics are logged on every run. The task fails only on a **systemic** collapse: `resolved == 0`
+or a resolution rate below 50% (computed over rows that reached the resolver, so parse-level
+dirtiness isn't counted against resolution). Below 90% logs a warning but proceeds.
 
 ---
 
-## 7. Prerequisites
+## 6. Results
+
+**Source resolution** — current input (5 CSVs, 58 rows) against ChEMBL 35:
+
+| Metric | Value |
+|--------|-------|
+| Parsed rows | 58 |
+| DQ-rejected (parse-level) | 1 — empty name (`CPD-043`) |
+| Reached resolver | 57 |
+| Resolved to `chembl_id` | 56 |
+| Resolution-quarantined | 1 — `Paracetamol` (unresolved synonym → Tier 3) |
+| **Resolution rate** | **98.25%** |
+
+**Ingestion** row counts (ChEMBL 35): `compound_structures` 2,474,590 · `molecule_dictionary`
+2,496,335 · `compound_properties` 2,478,212 · `chembl_id_lookup` 4,806,457.
+
+_Fingerprint / similarity / view results to follow as those stages are built._
+
+---
+
+## 7. Project structure
+
+```
+README.md
+dags/{similarity_pipeline.py, callbacks.py}
+tasks/
+  chembl_ingestion/       [built]  acquire dump -> staging -> S3; load parquet -> Postgres
+  source_resolution/      [built]  parse + DQ + name->chembl_id -> silver/source_set
+  fingerprint_generation/ (pending)
+  similarity_computation/ (pending)
+  dwh_load/               (pending)
+local_deployment/
+  docker-compose.yml
+  migrations/{01_staging.sql, 02_core_star_schema.sql, 03_views.sql}
+  init-dwh-db.sql
+```
+
+Each `tasks/*` folder is an independently containerised unit (`gen/{repository,services,
+utils}.py` + `run.py`) with its own dependencies. Views are created by migration
+`03_views.sql`; the DAG does not build them.
+
+---
+
+## 8. Prerequisites
 
 - Docker + docker-compose
-- AWS credentials with access to the course S3 bucket (`De-School-students` SSO profile, `eu-central-1`)
-- **Cold run only:** ~8–25 GB free disk for the one-time ChEMBL dump extraction
-  (afterwards the extract is cached in S3 and the download is skipped entirely)
-- An MS Teams incoming webhook (Power Automate) for failure notifications
+- AWS credentials for the course S3 bucket (`De-School-students` SSO profile, `eu-central-1`)
+- Cold run only: several GB of local disk for the one-time ChEMBL dump (cached in S3 after)
+- An MS Teams incoming webhook for failure notifications (optional for local runs)
 
 ---
 
-## 8. Setup & launch
+## 9. Setup & launch
 
 ```bash
-# 1. Start the stack (Postgres + Airflow); migrations create staging/core/views
 cd local_deployment
-docker-compose up -d
-
-# 2. Configure Airflow Variable and connections
-#    CHEMBL_RELEASE=37   (current release, May 2026)
-#    plus S3 + Postgres + Teams connections via airflow_settings.yaml
-
-# 3. Trigger the pipeline
-#    Airflow UI → similarity_pipeline → Trigger DAG
+cp .env.example .env          # set CHEMBL_RELEASE=35 and the Airflow image tag
+docker-compose up -d          # migrations create staging + core schemas
 ```
 
-**Cold path** (first run ever): downloads and extracts the ChEMBL dump — several GB and the
-full fingerprint generation. Runs once; the results are cached in S3.
-
-**Warm path** (every subsequent run): `acquire` and `generate_fingerprints` skip on cache
-hit, so a full run re-does only the cheap analytics stages. This is the path used for the demo.
-
----
-
-## 9. Testing
+Airflow UI: `http://localhost:8080`, user `admin`, password auto-generated (Airflow 3):
 
 ```bash
-# Per-task unit tests
-cd tasks/<task> && pytest
-
-# End-to-end on the mini-corpus (local_deployment/fixtures)
-# runs the whole pipeline on ~500 molecules + the real batch CSVs in seconds
+docker-compose logs airflow-apiserver | grep -i password
 ```
 
-Coverage highlights: parser routing (valid vs invalid), validators (`ic50<=0` → **valid +
-flag**, empty name → quarantine), resolver (name → chembl_id, MW cross-check, ambiguous /
-unresolved), fingerprints (known SMILES → known on-bits, unparseable → skip), similarity
-(reference Tanimoto pair, self-match excluded), ranking (boundary ties). The e2e test runs
-twice to assert idempotency.
+### Airflow 3 setup notes
+
+Airflow 3 differs from 2.x in three ways this custom compose accounts for (each caused a startup
+failure until fixed):
+
+- **Auth**: default auth manager is `SimpleAuthManager`; `airflow users create` (a FAB command)
+  no longer exists — the admin password is auto-generated.
+- **Task execution API**: tasks run via an execution API whose default URL is
+  `http://localhost:8080`, the wrong host inside the scheduler container — so
+  `AIRFLOW__CORE__EXECUTION_API_SERVER_URL` must point at the `airflow-apiserver` service.
+- **JWT**: scheduler and api-server must share `AIRFLOW__API_AUTH__JWT_SECRET`, or task tokens
+  fail signature verification.
 
 ---
 
-## 10. Example results
+## 10. Running the stages manually
 
-_Populated after the first full run (see execution plan, Phase 12)._
+```bash
+# ChEMBL ingestion (Bronze)
+cd tasks/chembl_ingestion
+export CHEMBL_RELEASE=35 DE_SCHOOL_S3_BUCKET=de-school-educational-data
+export S3_ROOT_PREFIX=final_task/hovhannes_karapetian
+export DWH_DSN=postgresql://airflow:airflow@localhost:5432/dwh AWS_PROFILE=De-School-students
+python run.py acquire      # dump -> 4 projected tables -> S3 (cached on _SUCCESS)
+python run.py load         # S3 parquet -> staging.* via COPY
 
-The five views delivered on top of the data mart:
-
-- **7a — average similarity per source molecule.**
-- **7b — average deviation of a neighbour's `alogp` from the source molecule.**
-- **8a — pivot:** 10 random source molecules as columns, target `chembl_id` as rows, similarity in the cells.
-- **8b — window view:** each (source, target, score) row plus the next-ranked target for that
-  source and that source's 2nd-ranked target. _(Exact ranking scope pending
-  confirmation — see Open questions.)_
-- **8c — grouped averages** via `GROUPING SETS` (per source; per source's aromatic_rings +
-  heavy_atoms; per source's heavy_atoms; whole dataset), with aggregation nulls shown as `TOTAL`.
-
-> Placeholder — sample rows and a screenshot of each view's output will be added here.
+# Source resolution (Silver)
+cd ../source_resolution
+export INPUT_S3_PREFIX=input/hovhannes-karapetian/    # plus the vars above
+python run.py resolve      # parse + DQ + resolve -> silver/source_set
+```
 
 ---
 
-## 11. Key design decisions
+## 11. Testing
+
+```bash
+cd tasks/<task> && pytest
+```
+
+Unit tests mock IO to test orchestration; integration tests (e.g. `truncate_and_copy` against a
+real Postgres, gated on `DWH_DSN`) exercise the real path. `ruff`, `mypy`, and Conventional-Commit
+enforcement run via `pre-commit` on every commit.
+
+Coverage so far: parser robustness (schema drift, case-insensitive columns, `N/A`, empty name),
+validators (`ic50<=0` -> valid+flag, empty name -> quarantine), resolver (exact match, MW
+verification, disambiguation, ambiguous/unresolved/no-structure), COPY round-trip (NULL vs empty
+string), and orchestration (dedup with flag union, DQ gate thresholds).
+
+---
+
+## 12. Key design decisions
 
 | # | Decision | Rationale |
 |---|----------|-----------|
-| Ingestion | Release dump, not REST API for bulk | Quarterly releases → full refresh per release; offset pagination over 5.4M rows is an OLTP interface abused for a bulk task |
-| Layers | 2 DWH schemas + S3 lake tier | Honest description; Silver is an artifact store, not DWH tables |
-| Bronze | All rows, needed columns only | Projection = storage; selection = semantics (deferred to Silver) |
-| Versioning | Everything keyed by `CHEMBL_RELEASE` | Deterministic keys → idempotency for free; proves the pipeline is not a one-off |
-| Dimension | SCD Type 1 + surrogate key | Static reference data; `chembl_id` not immutable (OBSOLETE merges) |
-| Similarity | Single streaming task | Compute is seconds; orchestration overhead would dominate |
-| Ranking | Over the full table | Tie flag needs the complete 10th-place count |
-| Isolation | READ COMMITTED (default) | Contention removed by design: parallel writes go to distinct S3 keys; the mart is rebuilt in one transaction |
-| Orchestration | One DAG, cadence split via cache skip | A second DAG would add a component for a separation the cache already provides |
-| Not done | SCD2, incremental load, Spark, sensors | Scope discipline for a quarterly, single-host, static-input pipeline |
+| Ingestion | Release dump, not REST API for bulk | Quarterly releases -> full refresh; offset pagination over 5.4M rows abuses an OLTP interface |
+| Release | Pinned to ChEMBL 35 | `cx_logp` / `molecular_species` (brief 6a) exist only through release 35 |
+| Layers | 2 DWH schemas + S3 lake tier | Honest: Silver is an artifact store, not warehouse tables |
+| Versioning | Everything keyed by `CHEMBL_RELEASE` | Deterministic keys -> idempotency; proves the pipeline is repeatable |
+| Cache | `_SUCCESS` marker, not bare prefix | A partial upload isn't mistaken for a complete one |
+| Staging types | TEXT for CSVs, native for ChEMBL | Different origin -> different rules |
+| Resolver MW | Verifier, never selector | Mass is shared by many molecules; name leads, MW confirms |
+| Resolver tiers | Tier 1 active; Tier 2/3 deferred with seams | YAGNI, measured: no salts in input; one synonym miss |
+| Dimension | SCD Type 1 + surrogate key | Static reference data; `chembl_id` not immutable |
+| Isolation | READ COMMITTED (default) | Contention removed by design: parallel writes to distinct S3 keys; mart rebuilt in one transaction |
+| Not done | SCD2, incremental load, Spark, streaming in the resolver | Scope discipline for a quarterly, single-host, small-source-set pipeline |
 
 ---
 
-## 12. Known limitations
+## 13. Pipeline status
 
-- The full per-molecule similarity table (~1 GB for a few hundred output rows) is written to
-  satisfy step 4 and to make the tie flag auditable. This is compliance + evidence, not an
-  engineering optimum, and is stated as such.
-- The cold path requires several GB of local disk for a one-time dump extraction. The graded
-  reviewer pays zero for this — the extract is cached in S3.
-- The DAG is intentionally near-linear with no sensors: the input is static, so a sensor would
-  be theatre. Parallelism exists only where there are real minutes to save (fingerprints).
+| Stage | Task | Status |
+|-------|------|--------|
+| Acquire ChEMBL -> S3 (Bronze) | `chembl_ingestion` | built, verified on real data |
+| Load parquet -> `staging.*` | `chembl_ingestion` | built, verified |
+| Resolve names -> `chembl_id` | `source_resolution` | built, verified (98.25%) |
+| Morgan fingerprints | `fingerprint_generation` | pending |
+| Tanimoto + top-10 + tie flag | `similarity_computation` | pending |
+| Load star schema | `dwh_load` | pending |
+| Analytical views (7a-8c) | `03_views.sql` | pending |
+| DAG wiring + Teams + demo | `dags/` | pending |
 
 ---
 
-## Open questions
+## 14. Views (planned)
 
-- **View 8b** — whether the "next / second most similar target" ranking stays entirely within
-  the source molecule's scope or shifts to target→target chaining. Implemented as
-  source-scoped (Interpretation 1) and isolated in a single file, pending confirmation.
+- **7a** — average similarity per source molecule.
+- **7b** — average deviation of a neighbour's `alogp` from the source molecule.
+- **8a** — pivot: 10 random source molecules as columns, target `chembl_id` as rows, similarity in the cells.
+- **8b** — each (source, target, score) row plus, **within the source's own ranking**, the
+  next-ranked target and the source's 2nd-ranked target. Confirmed source-scoped by the mentor
+  ("go with the first interpretation") — no target->target chaining.
+- **8c** — grouped averages via `GROUPING SETS` (per source; per source's aromatic_rings +
+  heavy_atoms; per source's heavy_atoms; whole dataset), aggregation nulls shown as `TOTAL`,
+  no `UNION`.
