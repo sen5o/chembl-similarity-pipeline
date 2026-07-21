@@ -1,19 +1,71 @@
-"""IO boundary for source resolution: the ChEMBL candidate lookup.
+"""IO boundary for source resolution: S3 input/output + the ChEMBL lookup.
 
-One narrow query resolves the whole batch: given the normalised input names,
-return every matching molecule_dictionary row joined to its properties (MW)
-and a flag for whether it has a structure. Returning *all* matches per name
-(not LIMIT 1) is deliberate — the resolver needs to see multiplicity to
-detect ambiguity. Everything the resolver decides is computed in Python from
-this result; this module only reads.
+The ChEMBL candidate lookup runs one narrow query: given the normalised
+input names, return every matching molecule_dictionary row joined to its
+properties (MW) and a flag for whether it has a structure. Returning *all*
+matches per name (not LIMIT 1) is deliberate — the resolver needs to see
+multiplicity to detect ambiguity. Everything the resolver decides is
+computed in Python from this result; this module only reads/writes.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
+
+import boto3
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 log = logging.getLogger("source_resolution")
+
+
+# --------------------------------------------------------------------------
+# S3 — input CSVs and output parquet
+# --------------------------------------------------------------------------
+
+
+def list_input_csvs(bucket: str, prefix: str) -> list[str]:
+    """List keys of *.csv objects under the input prefix (any count)."""
+    s3 = boto3.client("s3")
+    keys: list[str] = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            if obj["Key"].lower().endswith(".csv"):
+                keys.append(obj["Key"])
+    log.info("Found %s input CSV(s) under s3://%s/%s", len(keys), bucket, prefix)
+    return keys
+
+
+def download_file(bucket: str, key: str, dest: Path) -> Path:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    boto3.client("s3").download_file(bucket, key, str(dest))
+    return dest
+
+
+def write_parquet(rows: list[dict], schema: pa.Schema, dest: Path) -> None:
+    """Write rows (list of dicts) to a parquet file with an explicit schema.
+    An empty list still writes a valid empty parquet with the right schema.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if rows:
+        table = pa.Table.from_pylist(rows, schema=schema)
+    else:
+        table = schema.empty_table()
+    pq.write_table(table, dest)
+    log.info("Wrote %s rows -> %s", len(rows), dest)
+
+
+def upload_file(local_path: Path, bucket: str, key: str) -> None:
+    boto3.client("s3").upload_file(str(local_path), bucket, key)
+    log.info("Uploaded %s -> s3://%s/%s", local_path, bucket, key)
+
+
+# --------------------------------------------------------------------------
+# ChEMBL candidate lookup (Postgres)
+# --------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
