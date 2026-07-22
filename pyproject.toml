@@ -15,11 +15,11 @@ quote-style = "double"
 
 [tool.mypy]
 python_version = "3.11"
-# Libraries like rdkit, pyarrow, boto3 ship without type stubs. Without this,
-# mypy floods you with "library has no stubs" noise unrelated to your code.
 ignore_missing_imports = true
-# Pragmatic baseline for a learning project — not full strict mode.
 warn_unused_ignores = true
 warn_redundant_casts = true
 check_untyped_defs = true
+explicit_package_bases = true
+namespace_packages = true
+mypy_path = "tasks/chembl_ingestion:tasks/source_resolution:tasks/fingerprint_generation"
 exclude = ["migrations", "logs"]
