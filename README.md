@@ -15,7 +15,8 @@ Built with **Airflow 3**, **PostgreSQL**, **AWS S3**, and **RDKit**, deployed lo
 
 ## 1. What it does
 
-1. Ingests four ChEMBL tables (the full compound universe, ~2.5M molecules).
+1. Ingests four ChEMBL tables (the full compound universe: ~2.5M molecules, of which
+   ~2.47M carry a 2-D structure).
 2. Resolves the input compound names → ChEMBL IDs, applying data-quality rules.
 3. Computes **Morgan fingerprints** (radius 2, 2048 bits) for every ChEMBL structure.
 4. Computes **Tanimoto similarity** of each input compound against the full corpus.
@@ -32,10 +33,12 @@ molecule count.
 
 The pipeline is pinned to **ChEMBL 35** via `CHEMBL_RELEASE`, not the latest release. The brief
 (6a) requires `cx_logp` and `molecular_species` in the dimension table. These ChemAxon-computed
-properties existed only through ChEMBL 35 and were removed afterwards (verified: both are absent
-from the entire release-37 dump, checked across all tables). Release 35 is the most recent
-release that still contains both. Ingestion is release-keyed end to end (`.../release=35/…`), so
-switching releases is a single variable change and re-runs are idempotent.
+properties existed only through ChEMBL 35 and were removed afterwards. This was verified against
+real dumps: both columns are absent from the entire release-37 dump (checked across all tables)
+and present in release 35 — where `cx_logp` is populated for ~97% of molecules (2,409,279 of
+2,478,212). Release 35 is the most recent release that still contains both. Ingestion is
+release-keyed end to end (`.../release=35/…`), so switching releases is a single variable change
+and re-runs are idempotent.
 
 ---
 
@@ -158,7 +161,12 @@ dirtiness isn't counted against resolution). Below 90% logs a warning but procee
 | **Resolution rate** | **98.25%** |
 
 **Ingestion** row counts (ChEMBL 35): `compound_structures` 2,474,590 · `molecule_dictionary`
-2,496,335 · `compound_properties` 2,478,212 · `chembl_id_lookup` 4,806,457.
+2,496,335 · `compound_properties` 2,478,212 · `chembl_id_lookup` 4,806,457. Postgres row counts
+match the S3 `_SUCCESS` manifest exactly for all four tables. Values were verified beyond counts:
+no NULL/empty-string confusion in structures, numeric ranges sane (`avg mw_freebase` 433.1,
+`cx_logp` ∈ [−20.95, 24.88]), and `molregno` non-null and unique across the dictionary — so
+downstream joins are safe. The ~21.7k dictionary rows without a structure are records that
+legitimately have no 2-D structure and are excluded at the fingerprint stage.
 
 _Fingerprint / similarity / view results to follow as those stages are built._
 

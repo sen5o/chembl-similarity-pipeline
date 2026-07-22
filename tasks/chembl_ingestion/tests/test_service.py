@@ -17,7 +17,7 @@ from gen import services
 
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
-    monkeypatch.setenv("CHEMBL_RELEASE", "37")
+    monkeypatch.setenv("CHEMBL_RELEASE", "35")
     monkeypatch.setenv("DE_SCHOOL_S3_BUCKET", "test-bucket")
     monkeypatch.setenv("DWH_DSN", "postgresql://u:p@localhost:5432/dwh")
 
@@ -29,9 +29,9 @@ def test_acquire_chembl_skips_download_on_cache_hit():
     ):
         result = services.acquire_chembl()
 
-    cache_hit.assert_called_once_with("test-bucket", "bronze/chembl/release=37")
+    cache_hit.assert_called_once_with("test-bucket", "bronze/chembl/release=35")
     download_dump.assert_not_called()
-    assert result == "bronze/chembl/release=37"
+    assert result == "bronze/chembl/release=35"
 
 
 def test_acquire_chembl_extracts_and_uploads_every_table_on_cache_miss(tmp_path):
@@ -53,7 +53,7 @@ def test_acquire_chembl_extracts_and_uploads_every_table_on_cache_miss(tmp_path)
 
     write_marker.assert_called_once()
     _, _, manifest = write_marker.call_args.args
-    assert manifest["release"] == "37"
+    assert manifest["release"] == "35"
     assert set(manifest["tables"]) == set(services.TABLE_COLUMNS)
     assert all(t["rows"] == 10 for t in manifest["tables"].values())
 
