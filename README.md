@@ -7,15 +7,17 @@ results through a dimensional data mart.
 Built with **Airflow 3**, **PostgreSQL**, **AWS S3**, and **RDKit**, deployed locally via
 `docker-compose`.
 
-> **Status.** Built and verified end-to-end on real data: ChEMBL ingestion (Bronze) and source
-> resolution (Silver). Pending: fingerprint generation, similarity computation, DWH load, and
-> analytical views. See §13 for the full status table.
+> **Status.** All data stages are built and verified end-to-end on real ChEMBL 35 data:
+> ingestion, source resolution, fingerprints, similarity, DWH load, and the analytical views.
+> Remaining: wiring the DAG tasks to the real containers and the Teams notification payload.
+> See §13 for the full status table.
 
 ---
 
 ## 1. What it does
 
-1. Ingests four ChEMBL tables (the full compound universe, ~2.5M molecules).
+1. Ingests four ChEMBL tables (the full compound universe: ~2.5M molecules, of which
+   ~2.47M carry a 2-D structure).
 2. Resolves the input compound names → ChEMBL IDs, applying data-quality rules.
 3. Computes **Morgan fingerprints** (radius 2, 2048 bits) for every ChEMBL structure.
 4. Computes **Tanimoto similarity** of each input compound against the full corpus.
@@ -32,10 +34,12 @@ molecule count.
 
 The pipeline is pinned to **ChEMBL 35** via `CHEMBL_RELEASE`, not the latest release. The brief
 (6a) requires `cx_logp` and `molecular_species` in the dimension table. These ChemAxon-computed
-properties existed only through ChEMBL 35 and were removed afterwards (verified: both are absent
-from the entire release-37 dump, checked across all tables). Release 35 is the most recent
-release that still contains both. Ingestion is release-keyed end to end (`.../release=35/…`), so
-switching releases is a single variable change and re-runs are idempotent.
+properties existed only through ChEMBL 35 and were removed afterwards. This was verified against
+real dumps: both columns are absent from the entire release-37 dump (checked across all tables)
+and present in release 35 — where `cx_logp` is populated for ~97% of molecules (2,409,279 of
+2,478,212). Release 35 is the most recent release that still contains both. Ingestion is
+release-keyed end to end (`.../release=35/…`), so switching releases is a single variable change
+and re-runs are idempotent.
 
 ---
 
@@ -46,12 +50,14 @@ and `core` (Gold); the Silver tier is an S3 data-lake tier holding intermediate 
 is the honest description — Silver is an artifact store, not warehouse tables.
 
 ```
-        INPUT                    BRONZE                     SILVER (S3)                  GOLD
-  input: ChEMBL dump (rel 35) + batch CSVs
-    -> staging.* (native types) + input (TEXT)
-      -> source_set {resolved, quarantine}  [built]
-         fingerprints / similarity          [pending]
-           -> core: dim_molecule + fact_similarity + views  [pending]
+   INPUT                BRONZE                    SILVER (S3)                   GOLD
+ChEMBL dump (rel 35) -> staging.* (native types) -> source_set {resolved, quarantine}
+batch CSVs           -> input_raw  (TEXT)        -> fingerprints/ (2.47M)
+                                                 -> similarity/   (56 full tables)
+                                                 -> top_similar/  (560 rows)
+                                                                    -> core.dim_molecule
+                                                                    -> core.fact_similarity
+                                                                    -> analytical views
 ```
 
 | Tier | Where it lives | Contents | Why a separate layer |
@@ -66,15 +72,30 @@ is the honest description — Silver is an artifact store, not warehouse tables.
 - **ChEMBL tables** keep **native types** — ChEMBL is a curated relational source.
 
 Bronze keeps **all rows, needed columns only**: projection is a storage decision; row filtering
-(`entity_type`, non-`OBSOLETE`, has-structure) is semantic and applied downstream, at the
-fingerprint stage.
+(`entity_type`, `status`, has-structure) is semantic and applied downstream.
+
+### The corpus is a filtered read, not a materialised layer
+
+The "corpus" (the compound universe searched for neighbours) is defined once, in
+`fingerprint_generation`'s `read_corpus_partition`: `entity_type = 'COMPOUND'`,
+`status = 'ACTIVE'`, has a structure, partitioned by `molregno % N`.
+
+It is **not** materialised as a separate Silver artifact. On ChEMBL 35 those filters remove
+nothing — measured: all 2,474,590 structured molecules are ACTIVE COMPOUND, and none has a NULL
+or empty SMILES — so writing 2.47M rows back to S3 would duplicate data without cleaning it. The
+filters stay because they encode the rule explicitly and defend against a dirtier future release.
+That single function is also the seam where a materialised corpus would slot in if one were ever
+needed.
 
 ### S3 layout (under `final_task/hovhannes_karapetian/`)
 
 ```
 bronze/chembl/release=35/{compound_structures,molecule_dictionary,
-                          compound_properties,chembl_id_lookup}/*.parquet + _SUCCESS
+                          compound_properties,chembl_id_lookup}/part-000.parquet + _SUCCESS
 silver/source_set/{resolved,quarantine}.parquet
+silver/fingerprints/release=35/part-000..015.parquet + per-partition _SUCCESS
+silver/similarity/release=35/source_chembl_id=<id>/part-000.parquet     (56 full tables)
+silver/top_similar/release=35/{top10.parquet,_SUCCESS}
 ```
 
 Input CSVs live separately under `input/hovhannes-karapetian/` (input path uses a hyphen; the
@@ -93,12 +114,23 @@ output prefix uses an underscore).
 | `molecule_type` | `molecule_dictionary` |
 | `mw_freebase, alogp, psa, cx_logp, molecular_species, full_mwt, aromatic_rings, heavy_atoms` | `compound_properties` |
 
-**SCD Type 1** — molecular properties are static reference data. A surrogate key is used because
-ChEMBL merges molecules and marks IDs `OBSOLETE`, so `chembl_id` is not immutable.
+**SCD Type 1** — molecular properties are static reference data for a pinned release. A
+surrogate key is used because ChEMBL merges molecules and retires IDs, so `chembl_id` is not
+immutable. On a single pinned release that is mostly about modelling the pattern correctly
+rather than solving an observed problem — stated plainly rather than overclaimed.
 
-**`fact_similarity`** — grain: one row per (source, target-in-top-10) pair:
+**`fact_similarity`** — grain: one row per (source, target-in-top-10):
 `source_molecule_key`, `target_molecule_key`, `tanimoto_score`,
-`has_duplicates_of_last_largest_score`. Test invariant: `count = N_sources × 10`.
+`has_duplicates_of_last_largest_score`. Invariant: `count = N_sources × 10`.
+
+Schema-level guarantees rather than code-only ones: `CHECK` constraints keep `tanimoto_score`
+within [0,1] and forbid self-similarity rows; the PK forbids a target appearing twice in one
+source's top-10.
+
+**The full per-source similarity tables are deliberately not loaded into Postgres.** They are
+2.47M rows each (138M total) and exist in S3 as the brief's step-4 evidence. No view queries
+them, so materialising them in the warehouse would be dead weight; the mart carries what the
+analytics actually read.
 
 ---
 
@@ -116,9 +148,9 @@ reject — per the mentor's ruling.
 
 The parser maps columns to canonical fields by name (case-insensitive, synonym-aware), not by
 position or count, and tolerates BOM, whitespace, quoting, ragged rows, and `N/A` without
-crashing — robust to arbitrary input. DQ flags live in the Silver `source_set` (grain = input
-row), not the warehouse (grain = molecule). Dedup is by `chembl_id`, after resolution, merging
-the `dq_flags` of collapsed rows.
+crashing. DQ flags live in the Silver `source_set` (grain = input row), not the warehouse
+(grain = molecule). Dedup is by `chembl_id`, after resolution, merging the `dq_flags` of
+collapsed rows.
 
 ### Resolver — strategy chain
 
@@ -132,9 +164,9 @@ the `dq_flags` of collapsed rows.
 Molecular weight is a **verifier, never a selector**: name leads, MW confirms or disambiguates.
 A candidate is accepted only if it has a structure and its `mw_freebase`/`full_mwt` is within
 `max(0.5 Da, 1%)` of the input weight. Multiple name matches are disambiguated by MW; if MW
-can't pick one, the row is quarantined as `ambiguous` rather than guessed. Tier 2 and Tier 3 are
-deferred (current input has no salts, and the one synonym miss is Paracetamol); both slot into
-the chain later without rework, and any unresolved salt/synonym quarantines cleanly.
+can't pick one, the row is quarantined as `ambiguous` rather than guessed. Tiers 2 and 3 are
+deferred on measured grounds: the current input contains no salts, and the single synonym miss
+is Paracetamol. Both slot into the chain later without rework.
 
 ### DQ gate
 
@@ -144,9 +176,21 @@ dirtiness isn't counted against resolution). Below 90% logs a warning but procee
 
 ---
 
-## 6. Results
+## 6. Results (measured on ChEMBL 35)
 
-**Source resolution** — current input (5 CSVs, 58 rows) against ChEMBL 35:
+### Ingestion
+
+Row counts: `compound_structures` 2,474,590 · `molecule_dictionary` 2,496,335 ·
+`compound_properties` 2,478,212 · `chembl_id_lookup` 4,806,457. Postgres counts match the S3
+`_SUCCESS` manifest exactly for all four tables. Values were verified beyond counts: no
+NULL/empty-string confusion in structures, sane numeric ranges (`avg mw_freebase` 433.1,
+`cx_logp` ∈ [−20.95, 24.88]), and `molregno` non-null and unique across the dictionary — so
+downstream joins are safe. The ~21.7k dictionary rows without a structure are records that
+legitimately have no 2-D structure and are excluded at the fingerprint stage.
+
+### Source resolution
+
+Current input (5 CSVs, 58 rows):
 
 | Metric | Value |
 |--------|-------|
@@ -157,10 +201,44 @@ dirtiness isn't counted against resolution). Below 90% logs a warning but procee
 | Resolution-quarantined | 1 — `Paracetamol` (unresolved synonym → Tier 3) |
 | **Resolution rate** | **98.25%** |
 
-**Ingestion** row counts (ChEMBL 35): `compound_structures` 2,474,590 · `molecule_dictionary`
-2,496,335 · `compound_properties` 2,478,212 · `chembl_id_lookup` 4,806,457.
+### Fingerprints
 
-_Fingerprint / similarity / view results to follow as those stages are built._
+2,474,576 fingerprints across 16 partitions, ~25 s per partition (~7 min for the full corpus,
+sequential). **14 SMILES out of 2.47M (0.0006%) could not be parsed by RDKit** and are excluded;
+they are counted in each partition's reconciliation manifest (`structures_in` vs
+`fingerprints_out`) rather than silently dropped.
+
+### Similarity
+
+56 sources × 2,474,576 corpus = ~138M Tanimoto comparisons; 560 top-10 rows (56 × 10), no source
+missing from the corpus. The corpus loads into memory as 2.47M `ExplicitBitVect` objects in
+**1,110 MB** (measured), which is what made the single-task, load-once design viable.
+
+Run times, all measured: cold run **8:33**; warm run reusing per-source tables **5:25**;
+fully cached run **2.3 s**.
+
+### Data mart
+
+615 dimension rows, 560 facts, 56 distinct sources, 607/615 molecules carrying `cx_logp`. The
+615 is one fewer than the 616 upper bound (56 sources + 560 unique targets) because exactly one
+molecule appears both as a source and as another source's neighbour.
+
+### Finding: 71 pairs score exactly 1.0
+
+71 of 560 facts (12.7%) have `tanimoto_score = 1.0` despite self-matches being excluded. These
+are **stereoisomer pairs**. Morgan fingerprints are built on connectivity and do not encode
+stereochemistry (`includeChirality` defaults to false), so enantiomers are bit-identical.
+Verified on real structures:
+
+```
+CHEMBL521  IBUPROFEN     CC(C)Cc1ccc( C(C)C(=O)O )cc1
+CHEMBL175  DEXIBUPROFEN  CC(C)Cc1ccc([C@H](C)C(=O)O)cc1
+```
+
+Identical connectivity; the only difference is the `[C@H]` stereo marker. Same for
+citalopram / escitalopram. This is expected behaviour for structural similarity search, not a
+defect — and it is precisely why self-matches are excluded **by `chembl_id`, not by
+`score = 1.0`**: the latter would have discarded 71 legitimate nearest neighbours.
 
 ---
 
@@ -170,11 +248,11 @@ _Fingerprint / similarity / view results to follow as those stages are built._
 README.md
 dags/{similarity_pipeline.py, callbacks.py}
 tasks/
-  chembl_ingestion/       [built]  acquire dump -> staging -> S3; load parquet -> Postgres
-  source_resolution/      [built]  parse + DQ + name->chembl_id -> silver/source_set
-  fingerprint_generation/ (pending)
-  similarity_computation/ (pending)
-  dwh_load/               (pending)
+  chembl_ingestion/       acquire dump -> S3 parquet; load parquet -> staging.*
+  source_resolution/      parse + DQ + name->chembl_id -> silver/source_set
+  fingerprint_generation/ Morgan(2,2048) over the corpus -> silver/fingerprints
+  similarity_computation/ Tanimoto + full tables + top-10 with tie flag
+  dwh_load/               silver top-10 -> core star schema
 local_deployment/
   docker-compose.yml
   migrations/{01_staging.sql, 02_core_star_schema.sql, 03_views.sql}
@@ -201,13 +279,21 @@ utils}.py` + `run.py`) with its own dependencies. Views are created by migration
 ```bash
 cd local_deployment
 cp .env.example .env          # set CHEMBL_RELEASE=35 and the Airflow image tag
-docker-compose up -d          # migrations create staging + core schemas
+docker-compose up -d          # migrations create staging + core schemas and views
 ```
 
 Airflow UI: `http://localhost:8080`, user `admin`, password auto-generated (Airflow 3):
 
 ```bash
 docker-compose logs airflow-apiserver | grep -i password
+```
+
+Migrations run only on a **first** boot with an empty volume. To apply them to an existing
+database:
+
+```bash
+docker-compose exec -T postgres psql -U airflow -d dwh < migrations/02_core_star_schema.sql
+docker-compose exec -T postgres psql -U airflow -d dwh < migrations/03_views.sql
 ```
 
 ### Airflow 3 setup notes
@@ -228,19 +314,31 @@ failure until fixed):
 ## 10. Running the stages manually
 
 ```bash
-# ChEMBL ingestion (Bronze)
-cd tasks/chembl_ingestion
 export CHEMBL_RELEASE=35 DE_SCHOOL_S3_BUCKET=de-school-educational-data
-export S3_ROOT_PREFIX=final_task/hovhannes_karapetian
-export DWH_DSN=postgresql://airflow:airflow@localhost:5432/dwh AWS_PROFILE=De-School-students
-python run.py acquire      # dump -> 4 projected tables -> S3 (cached on _SUCCESS)
-python run.py load         # S3 parquet -> staging.* via COPY
+export S3_ROOT_PREFIX=final_task/hovhannes_karapetian AWS_PROFILE=De-School-students
+export DWH_DSN=postgresql://airflow:airflow@localhost:5432/dwh
 
-# Source resolution (Silver)
+cd tasks/chembl_ingestion
+python run.py inspect        # print the release's real column names
+python run.py acquire        # dump -> 4 projected tables -> S3 (cached on _SUCCESS)
+python run.py load           # S3 parquet -> staging.* via COPY
+
 cd ../source_resolution
-export INPUT_S3_PREFIX=input/hovhannes-karapetian/    # plus the vars above
-python run.py resolve      # parse + DQ + resolve -> silver/source_set
+export INPUT_S3_PREFIX=input/hovhannes-karapetian/
+python run.py resolve        # parse + DQ + resolve -> silver/source_set
+
+cd ../fingerprint_generation
+export CORPUS_PARTITIONS=16
+for i in $(seq 0 15); do python run.py generate $i; done
+
+cd ../similarity_computation
+python run.py compute        # Tanimoto -> full tables + top-10
+
+cd ../dwh_load
+python run.py load           # top-10 -> core.dim_molecule + core.fact_similarity
 ```
+
+Every stage is idempotent: re-running a completed stage is a cache hit, not repeated work.
 
 ---
 
@@ -250,14 +348,19 @@ python run.py resolve      # parse + DQ + resolve -> silver/source_set
 cd tasks/<task> && pytest
 ```
 
-Unit tests mock IO to test orchestration; integration tests (e.g. `truncate_and_copy` against a
-real Postgres, gated on `DWH_DSN`) exercise the real path. `ruff`, `mypy`, and Conventional-Commit
-enforcement run via `pre-commit` on every commit.
+Unit tests mock IO to test orchestration; a few tests run the real library on small synthetic
+data (a 4-row SQLite dump, a 4-molecule corpus) to test correctness rather than wiring.
+`ruff`, `mypy`, and Conventional-Commit enforcement run via `pre-commit` on every commit; `mypy`
+runs per task, because each task has its own `gen` package and analysing them as one tree
+collides on the shared name.
 
-Coverage so far: parser robustness (schema drift, case-insensitive columns, `N/A`, empty name),
-validators (`ic50<=0` -> valid+flag, empty name -> quarantine), resolver (exact match, MW
-verification, disambiguation, ambiguous/unresolved/no-structure), COPY round-trip (NULL vs empty
-string), and orchestration (dedup with flag union, DQ gate thresholds).
+Coverage highlights: parser robustness (schema drift, case-insensitive columns, `N/A`, empty
+name); validators (`ic50<=0` → valid+flag, empty name → quarantine); resolver (exact match, MW
+verification, disambiguation, ambiguous/unresolved/no-structure); a regression test for a real
+bug where an all-NULL first chunk broke the parquet writer; COPY round-trip (NULL vs empty
+string); fingerprint reference values (aspirin = 24 on-bits) and binary round-trip; ranking
+tie-flag boundary cases (no tie / tie spilling past the cut-off / tie contained inside the
+top-10); cache paths; and the DWH referential-integrity guard.
 
 ---
 
@@ -265,17 +368,26 @@ string), and orchestration (dedup with flag union, DQ gate thresholds).
 
 | # | Decision | Rationale |
 |---|----------|-----------|
-| Ingestion | Release dump, not REST API for bulk | Quarterly releases -> full refresh; offset pagination over 5.4M rows abuses an OLTP interface |
+| Ingestion | Release dump, not REST API for bulk | Quarterly releases → full refresh; offset pagination over 5.4M rows abuses an OLTP interface |
+| Dump format | SQLite, not `pg_restore -t` | Parquet in S3 is required anyway (Bronze + brief step 3), so SQLite → parquet → COPY is one linear path instead of two |
 | Release | Pinned to ChEMBL 35 | `cx_logp` / `molecular_species` (brief 6a) exist only through release 35 |
 | Layers | 2 DWH schemas + S3 lake tier | Honest: Silver is an artifact store, not warehouse tables |
-| Versioning | Everything keyed by `CHEMBL_RELEASE` | Deterministic keys -> idempotency; proves the pipeline is repeatable |
+| Corpus | Filtered read, not a materialised Silver artifact | Measured: the filters remove nothing on release 35; materialising would duplicate 2.47M rows without cleaning them |
+| Versioning | Everything keyed by `CHEMBL_RELEASE` | Deterministic keys → idempotency; proves the pipeline is repeatable |
 | Cache | `_SUCCESS` marker, not bare prefix | A partial upload isn't mistaken for a complete one |
-| Staging types | TEXT for CSVs, native for ChEMBL | Different origin -> different rules |
+| Staging types | TEXT for CSVs, native for ChEMBL | Different origin → different rules |
+| Fingerprint storage | RDKit binary in a parquet `BYTES` column | Native round-trip for `BulkTanimotoSimilarity`; RDKit compresses sparse vectors (aspirin ≈ 41 B, not 256) |
 | Resolver MW | Verifier, never selector | Mass is shared by many molecules; name leads, MW confirms |
-| Resolver tiers | Tier 1 active; Tier 2/3 deferred with seams | YAGNI, measured: no salts in input; one synonym miss |
-| Dimension | SCD Type 1 + surrogate key | Static reference data; `chembl_id` not immutable |
+| Resolver tiers | Tier 1 active; Tiers 2/3 deferred with seams | Measured: no salts in the input; one synonym miss |
+| Similarity task | One task, corpus loaded once | Measured 1,110 MB resident; per-source mapping would reload it N times |
+| Top-10 | `heapq.nlargest`, not a full sort | Measured: 0.12 s vs 6 s per source — 5.6 min saved across 56 sources |
+| Self-match | Excluded by `chembl_id`, not by `score = 1.0` | 71 legitimate stereoisomer pairs score exactly 1.0 |
+| Similarity cache | Two layers: global marker + per-source | A cold run is 8.5 min and IO-bound; a retry resumes instead of recomputing |
+| Fact grain | Top-10 pairs only | Full 2.47M-row tables are step-4 evidence in S3; no view reads them |
+| Dimension | SCD Type 1 + surrogate key, facts-only scope | Static reference data; `chembl_id` not immutable; a dimension describes facts |
+| Pivot (8a) | Generic column slots + legend view | A view's columns are fixed at creation; hardcoding IDs breaks on new input, dynamic DDL moves schema into the pipeline |
 | Isolation | READ COMMITTED (default) | Contention removed by design: parallel writes to distinct S3 keys; mart rebuilt in one transaction |
-| Not done | SCD2, incremental load, Spark, streaming in the resolver | Scope discipline for a quarterly, single-host, small-source-set pipeline |
+| Not done | SCD2, incremental load, Spark, streaming, nested multiprocessing | Scope discipline; several were prototyped in design and dropped once measurement showed they bought nothing |
 
 ---
 
@@ -283,25 +395,36 @@ string), and orchestration (dedup with flag union, DQ gate thresholds).
 
 | Stage | Task | Status |
 |-------|------|--------|
-| Acquire ChEMBL -> S3 (Bronze) | `chembl_ingestion` | built, verified on real data |
-| Load parquet -> `staging.*` | `chembl_ingestion` | built, verified |
-| Resolve names -> `chembl_id` | `source_resolution` | built, verified (98.25%) |
-| Morgan fingerprints | `fingerprint_generation` | pending |
-| Tanimoto + top-10 + tie flag | `similarity_computation` | pending |
-| Load star schema | `dwh_load` | pending |
-| Analytical views (7a-8c) | `03_views.sql` | pending |
-| DAG wiring + Teams + demo | `dags/` | pending |
+| Acquire ChEMBL → S3 (Bronze) | `chembl_ingestion` | built, verified on real data |
+| Load parquet → `staging.*` | `chembl_ingestion` | built, verified |
+| Resolve names → `chembl_id` | `source_resolution` | built, verified (98.25%) |
+| Morgan fingerprints | `fingerprint_generation` | built, verified (2,474,576) |
+| Tanimoto + top-10 + tie flag | `similarity_computation` | built, verified (560 rows) |
+| Load star schema | `dwh_load` | built, verified (615 dim / 560 facts) |
+| Analytical views (7a–8c) | `03_views.sql` | built, verified |
+| DAG wiring + Teams payload | `dags/` | pending |
 
 ---
 
-## 14. Views (planned)
+## 14. Views
 
-- **7a** — average similarity per source molecule.
-- **7b** — average deviation of a neighbour's `alogp` from the source molecule.
-- **8a** — pivot: 10 random source molecules as columns, target `chembl_id` as rows, similarity in the cells.
-- **8b** — each (source, target, score) row plus, **within the source's own ranking**, the
-  next-ranked target and the source's 2nd-ranked target. Confirmed source-scoped by the mentor
-  ("go with the first interpretation") — no target->target chaining.
-- **8c** — grouped averages via `GROUPING SETS` (per source; per source's aromatic_rings +
-  heavy_atoms; per source's heavy_atoms; whole dataset), aggregation nulls shown as `TOTAL`,
-  no `UNION`.
+All six live in `core` and are created by migration.
+
+- **`v_avg_similarity_per_source`** (7a) — mean/min/max Tanimoto per source.
+- **`v_avg_alogp_deviation`** (7b) — mean |alogp(neighbour) − alogp(source)|. `alogp` is not
+  universally populated, so a `comparable_neighbours` count reports how many pairs actually
+  contributed instead of leaving the gap implicit.
+- **`v_pivot_source_legend`** + **`v_top10_pivot`** (8a) — the similarity matrix with ten
+  sources as columns. A view's column names are fixed at creation, so the columns are generic
+  slots and the legend maps slot → `chembl_id`; "random" is implemented as deterministic
+  pseudo-random (ordering by `md5(chembl_id)`) so the pivot is stable across queries.
+- **`v_neighbour_ranking_context`** (8b) — each (source, target) row plus the next-ranked and
+  the 2nd-ranked target **within that source's own ranking**; confirmed source-scoped with the
+  mentor, with no target→target chaining. The `nth_value` window carries an explicit
+  `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING` frame: the default frame ends at
+  the current row, so rank 1 would silently return NULL (verified).
+- **`v_similarity_grouping_sets`** (8c) — four groupings in one pass, no `UNION`: per source;
+  per source's (`aromatic_rings`, `heavy_atoms`); per source's `heavy_atoms`; and the whole
+  dataset. `GROUPING()` distinguishes a rolled-up key from a genuinely NULL value — both would
+  otherwise print as NULL — and rolled-up keys render as `TOTAL`. Grand total: 560 pairs,
+  average Tanimoto 0.8148.
