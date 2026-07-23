@@ -19,7 +19,7 @@ repos:
     hooks:
       - id: mypy-per-task
         name: mypy (per task)
-        entry: bash -c 'for t in tasks/*/; do (cd "$t" && mypy gen run.py) || exit 1; done; mypy dags'
+        entry: bash -c 'for t in tasks/*/; do if ls "$t"gen/*.py >/dev/null 2>&1; then (cd "$t" && mypy gen run.py) || exit 1; fi; done; mypy dags'
         language: system
         pass_filenames: false
         always_run: true
