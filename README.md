@@ -335,7 +335,7 @@ cache, by design — it is a full refresh).
 Failures post an Adaptive Card to Teams (`dags/callbacks.py`). The handler swallows its own
 errors: a broken webhook must never replace the exception that actually caused the failure.
 
-### Two things a fresh deployment needs
+### Three things a fresh deployment needs
 
 Both were found by rebuilding from a clean clone against an empty database — a warm cache had
 been hiding them:
@@ -348,6 +348,12 @@ been hiding them:
   cursor to "stream" each partition; on a cold cache that forced an incremental plan and
   round-tripped FETCH batches, turning a 1.4s join into 15+ minutes per partition. A partition
   is only ~12 MB, so a plain fetch is both simpler and ~40x faster.
+
+- **The docker socket must be the real path, not the symlink.** On Docker Desktop for Mac
+  `/var/run/docker.sock` is a symlink to `~/.docker/run/docker.sock`. Mounting the symlink into
+  the scheduler fails — inside the container the symlink's target does not exist, so DockerOperator
+  reports `FileNotFoundError` on the socket. The compose file mounts the resolved path via
+  `DOCKER_SOCK` (see `.env.example`).
 
 The first cold run is still somewhat slower than subsequent ones — the staging tables are read
 from disk before the OS cache is warm — but partitions now complete in ~25s each, not minutes.
@@ -490,6 +496,7 @@ top-10); cache paths; and the DWH referential-integrity guard.
 | Airflow image | Provider baked into a custom image | Runtime install breaks outright when the container runs as root, and repeats on every boot |
 | Corpus read | Plain client-side fetch, not a server-side cursor | A named cursor forced an incremental plan and round-tripped FETCH batches — 15+ min/partition vs a 1.4s join; the slice is ~12 MB, so streaming saved nothing |
 | Postgres shm | `shm_size: 1gb` on the container | Parallel hash joins share memory via /dev/shm; Docker's 64 MB default overflows when several partitions join at once |
+| Docker socket | Mount the resolved path, not `/var/run/docker.sock` | On Docker Desktop for Mac that path is a symlink whose target doesn't exist inside the container |
 | Isolation | READ COMMITTED (default) | Contention removed by design: parallel writes to distinct S3 keys; mart rebuilt in one transaction |
 | Not done | SCD2, incremental load, Spark, streaming, nested multiprocessing | Scope discipline; several were prototyped in design and dropped once measurement showed they bought nothing |
 
