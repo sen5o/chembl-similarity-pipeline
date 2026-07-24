@@ -1,0 +1,10 @@
+# Airflow with the docker provider baked in.
+#
+# The provider is required because the DAG runs each stage as its own container
+# via DockerOperator. Installing it at container start (_PIP_ADDITIONAL_REQUIREMENTS)
+# works but re-runs on every boot and breaks outright when the container runs as
+# root — which it must, to reach the docker socket. Baking it into the image
+# removes both problems.
+FROM apache/airflow:3.2.0
+
+RUN pip install --no-cache-dir apache-airflow-providers-docker==4.5.3
