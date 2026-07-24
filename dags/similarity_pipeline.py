@@ -1,19 +1,74 @@
 """ChEMBL molecular similarity pipeline.
 
-Iteration 1: skeleton only. Each task is a stub that logs and returns; real
-logic lands in its own feature iteration. The task graph already reflects the
-final dependency structure.
+Each stage runs in its own container (see tasks/*/Dockerfile) via
+DockerOperator — the containers are the unit of dependency isolation, so the
+DAG orchestrates them rather than importing their code. Airflow only needs the
+docker provider; RDKit, chembl_downloader and psycopg2 stay inside the images
+that actually use them.
+
+The graph mirrors the real stages. There is deliberately no separate ranking
+task: similarity_computation produces the full per-source tables and the top-10
+with the tie flag in one pass over the in-memory corpus, so splitting them would
+mean loading the 1.1 GB corpus twice.
+
+Every stage is idempotent and cache-aware, so re-triggering the DAG after a
+successful run skips the completed work instead of recomputing it.
 """
 
 from __future__ import annotations
 
-import logging
+import os
 
 import pendulum
-from airflow.sdk import dag, task
+from airflow.providers.docker.operators.docker import DockerOperator
+from airflow.sdk import dag
 from callbacks import notify_teams_on_failure
+from docker.types import Mount
 
-log = logging.getLogger(__name__)
+# --- configuration ---------------------------------------------------------
+
+CORPUS_PARTITIONS = int(os.environ.get("CORPUS_PARTITIONS", 16))
+
+# Task containers run as siblings on the compose network, not inside the
+# scheduler, so they reach Postgres by service name rather than localhost.
+TASK_ENV = {
+    "CHEMBL_RELEASE": os.environ.get("CHEMBL_RELEASE", "35"),
+    "DE_SCHOOL_S3_BUCKET": os.environ.get("DE_SCHOOL_S3_BUCKET", ""),
+    "S3_ROOT_PREFIX": os.environ.get("S3_ROOT_PREFIX", ""),
+    "INPUT_S3_PREFIX": os.environ.get("INPUT_S3_PREFIX", ""),
+    "AWS_PROFILE": os.environ.get("AWS_PROFILE", ""),
+    "AWS_REGION": os.environ.get("AWS_REGION", "eu-central-1"),
+    "DWH_DSN": os.environ.get("TASK_DWH_DSN", "postgresql://airflow:airflow@postgres:5432/dwh"),
+    "CORPUS_PARTITIONS": str(CORPUS_PARTITIONS),
+}
+
+# The compose network task containers join so they can resolve `postgres`.
+DOCKER_NETWORK = os.environ.get("TASK_DOCKER_NETWORK", "local_deployment_default")
+
+# Host paths mounted into every task container:
+#   ~/.aws   - SSO credentials, read-only; tasks authenticate as the operator does
+#   ~/.data  - chembl_downloader's cache, so a cold `acquire` doesn't re-download
+#              the multi-GB release dump on every container start
+HOST_HOME = os.environ.get("HOST_HOME", os.path.expanduser("~"))
+
+COMMON_MOUNTS = [
+    # Read-write: botocore writes refreshed SSO tokens back into ~/.aws/sso/cache,
+    # so a read-only mount fails the moment the token needs renewing.
+    Mount(source=f"{HOST_HOME}/.aws", target="/root/.aws", type="bind"),
+    Mount(source=f"{HOST_HOME}/.data", target="/root/.data", type="bind"),
+]
+
+# Runtime wiring shared by every task container. Kept in one dict so a regular
+# operator and a mapped one (.partial) cannot drift apart.
+CONTAINER_KWARGS = {
+    "environment": TASK_ENV,
+    "mounts": COMMON_MOUNTS,
+    "network_mode": DOCKER_NETWORK,
+    "docker_url": "unix://var/run/docker.sock",
+    "auto_remove": "success",
+    # Docker Desktop cannot bind the operator's default temp mount
+    "mount_tmp_dir": False,
+}
 
 DEFAULT_ARGS = {
     "owner": "data-eng",
@@ -29,55 +84,70 @@ DEFAULT_ARGS = {
     catchup=False,
     default_args=DEFAULT_ARGS,
     tags=["chembl", "similarity", "capstone"],
+    doc_md=__doc__,
 )
 def similarity_pipeline():
-    @task
-    def ingest_chembl() -> str:
-        """chembl_ingestion: dump -> staging -> silver/corpus (cache by release)."""
-        log.info("STUB ingest_chembl")
-        return "corpus_ready"
+    # --- Bronze ------------------------------------------------------------
+    acquire_chembl = DockerOperator(
+        task_id="acquire_chembl",
+        image="chembl-ingestion:latest",
+        command="acquire",
+        doc_md="Download the pinned ChEMBL release; project 4 tables to S3 parquet.",
+        **CONTAINER_KWARGS,
+    )
 
-    @task
-    def resolve_sources() -> str:
-        """source_resolution: parse + DQ + name->chembl_id."""
-        log.info("STUB resolve_sources")
-        return "sources_resolved"
+    load_staging = DockerOperator(
+        task_id="load_staging",
+        image="chembl-ingestion:latest",
+        command="load",
+        doc_md="S3 parquet -> staging.* via TRUNCATE + COPY (full refresh).",
+        **CONTAINER_KWARGS,
+    )
 
-    @task
-    def generate_fingerprints() -> str:
-        """fingerprint_generation: Morgan(2, 2048) over full corpus -> S3."""
-        log.info("STUB generate_fingerprints")
-        return "fingerprints_ready"
+    # --- Silver ------------------------------------------------------------
+    resolve_sources = DockerOperator(
+        task_id="resolve_sources",
+        image="chembl-source-resolution:latest",
+        command="resolve",
+        doc_md="Parse input CSVs, apply DQ rules, resolve names -> chembl_id.",
+        **CONTAINER_KWARGS,
+    )
 
-    @task
-    def compute_similarity() -> str:
-        """similarity_computation: Tanimoto -> per-source parquet -> S3."""
-        log.info("STUB compute_similarity")
-        return "similarity_ready"
+    # One mapped task per corpus partition: independent units of work, so a
+    # failure retries only its own slice rather than the whole corpus.
+    generate_fingerprints = DockerOperator.partial(
+        task_id="generate_fingerprints",
+        image="chembl-fingerprint-generation:latest",
+        doc_md="Morgan(2, 2048) over one corpus partition -> silver/fingerprints.",
+        **CONTAINER_KWARGS,
+    ).expand(
+        command=[f"generate {i}" for i in range(CORPUS_PARTITIONS)],
+    )
 
-    @task
-    def rank_top10() -> str:
-        """similarity_computation: top-10 + has_duplicates_of_last_largest_score."""
-        log.info("STUB rank_top10")
-        return "ranked"
+    compute_similarity = DockerOperator(
+        task_id="compute_similarity",
+        image="chembl-similarity-computation:latest",
+        command="compute",
+        doc_md="Tanimoto vs the full corpus; per-source tables + top-10 with tie flag.",
+        **CONTAINER_KWARGS,
+    )
 
-    @task
-    def load_dwh() -> str:
-        """dwh_load: parquet -> core.dim_molecule + core.fact_similarity."""
-        log.info("STUB load_dwh")
-        return "dwh_loaded"
+    # --- Gold --------------------------------------------------------------
+    load_dwh = DockerOperator(
+        task_id="load_dwh",
+        image="chembl-dwh-load:latest",
+        command="load",
+        doc_md="Silver top-10 -> core.dim_molecule + core.fact_similarity.",
+        **CONTAINER_KWARGS,
+    )
 
-    corpus = ingest_chembl()
-    sources = resolve_sources()
-    fps = generate_fingerprints()
+    # --- dependencies ------------------------------------------------------
+    # staging feeds both branches: the resolver looks molecules up by name and
+    # the fingerprint stage reads the corpus. The two are independent.
+    acquire_chembl >> load_staging >> [resolve_sources, generate_fingerprints]
 
-    # ingestion feeds both resolution and fingerprinting; they are independent
-    corpus >> [sources, fps]
-
-    similarity = compute_similarity()
-    [sources, fps] >> similarity
-
-    similarity >> rank_top10() >> load_dwh()
+    # similarity needs both the resolved sources and the complete fingerprint set
+    [resolve_sources, generate_fingerprints] >> compute_similarity >> load_dwh
 
 
 similarity_pipeline()
