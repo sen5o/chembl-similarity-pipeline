@@ -3,9 +3,8 @@
 #
 # NOTE: pin AIRFLOW_IMAGE_NAME to the version you developed against (memory: 3.2).
 # Verify service names against the official Airflow 3 compose for your patch level.
-
 x-airflow-common: &airflow-common
-  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:3.0.0}
+  image: ${AIRFLOW_IMAGE_NAME:-chembl-airflow:3.2.0}
   environment: &airflow-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
@@ -25,13 +24,40 @@ x-airflow-common: &airflow-common
     # its password is auto-generated and printed in the api-server logs on first boot.
     AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "admin:admin"
     TEAMS_WEBHOOK_URL: ${TEAMS_WEBHOOK_URL:-}
+
+    # The DAG runs each stage as its own container via DockerOperator, which needs
+    # the docker provider. Installed at container start rather than baked into a
+    # custom image: acceptable for a local deployment, and keeps the image pinned
+    # to the stock Airflow release. A production setup would build an image instead.
+
+    # --- values the DAG reads when it builds the task containers ---------------
+    CHEMBL_RELEASE: ${CHEMBL_RELEASE:-35}
+    DE_SCHOOL_S3_BUCKET: ${DE_SCHOOL_S3_BUCKET:-}
+    S3_ROOT_PREFIX: ${S3_ROOT_PREFIX:-}
+    INPUT_S3_PREFIX: ${INPUT_S3_PREFIX:-}
+    AWS_PROFILE: ${AWS_PROFILE:-}
+    AWS_REGION: ${AWS_REGION:-eu-central-1}
+    CORPUS_PARTITIONS: ${CORPUS_PARTITIONS:-16}
+
+    # Task containers talk to Postgres as siblings on the compose network, so they
+    # address it by service name — localhost would be their own loopback.
+    TASK_DWH_DSN: postgresql://airflow:airflow@postgres:5432/dwh
+    # Compose names the default network <project>_default; the project name is this
+    # directory unless overridden. Check with: docker network ls
+    TASK_DOCKER_NETWORK: ${TASK_DOCKER_NETWORK:-local_deployment_default}
+
+    # Bind-mount sources are resolved by the HOST docker daemon, not inside this
+    # container, so this must be the host's home directory (e.g. /Users/you) —
+    # expanding ~ inside the container would yield /home/airflow and break the mount.
+    HOST_HOME: ${HOST_HOME:?set HOST_HOME to your host home directory, e.g. /Users/you}
   volumes:
     - ../dags:/opt/airflow/dags
     - airflow-logs:/opt/airflow/logs
+    # Lets DockerOperator start sibling containers on the host daemon.
+    - /var/run/docker.sock:/var/run/docker.sock
   depends_on: &airflow-deps
     postgres:
       condition: service_healthy
-
 services:
   postgres:
     image: postgres:16
@@ -49,8 +75,9 @@ services:
       retries: 5
     ports:
       - "5432:5432"
-
   # Applies DWH DDL migrations (01, 02, 03) to the `dwh` database, in order.
+  # Every migration is idempotent (CREATE ... IF NOT EXISTS / CREATE OR REPLACE),
+  # so this runs safely on every boot, not just the first.
   migrate:
     image: postgres:16
     depends_on:
@@ -64,7 +91,6 @@ services:
       bash -c "for f in /migrations/*.sql; do
         echo \"applying $$f\"; psql -h postgres -U airflow -d dwh -f \"$$f\" || exit 1;
       done"
-
   airflow-init:
     <<: *airflow-common
     # Airflow 3 defaults to SimpleAuthManager; `airflow users create` is a FAB-only
@@ -73,7 +99,6 @@ services:
     entrypoint: >
       bash -c "airflow db migrate"
     depends_on: *airflow-deps
-
   airflow-apiserver:
     <<: *airflow-common
     command: api-server
@@ -84,21 +109,21 @@ services:
         condition: service_healthy
       airflow-init:
         condition: service_completed_successfully
-
   airflow-scheduler:
     <<: *airflow-common
     command: scheduler
+    # LocalExecutor runs task processes inside this container, so this is where
+    # DockerOperator talks to the docker socket. The socket is root-owned; the
+    # airflow user (uid 50000) cannot open it without this.
     depends_on:
       airflow-init:
         condition: service_completed_successfully
-
   airflow-dag-processor:
     <<: *airflow-common
     command: dag-processor
     depends_on:
       airflow-init:
         condition: service_completed_successfully
-
 volumes:
   postgres-data:
   airflow-logs:
