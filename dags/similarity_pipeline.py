@@ -46,7 +46,7 @@ TASK_ENV = {
 DOCKER_NETWORK = os.environ.get("TASK_DOCKER_NETWORK", "local_deployment_default")
 
 # Host paths mounted into every task container:
-#   ~/.aws   - SSO credentials; tasks authenticate as the operator does
+#   ~/.aws   - SSO credentials, read-only; tasks authenticate as the operator does
 #   ~/.data  - chembl_downloader's cache, so a cold `acquire` doesn't re-download
 #              the multi-GB release dump on every container start
 HOST_HOME = os.environ.get("HOST_HOME", os.path.expanduser("~"))
