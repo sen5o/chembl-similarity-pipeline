@@ -54,7 +54,7 @@ x-airflow-common: &airflow-common
     - ../dags:/opt/airflow/dags
     - airflow-logs:/opt/airflow/logs
     # Lets DockerOperator start sibling containers on the host daemon.
-    - /var/run/docker.sock:/var/run/docker.sock
+    - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
   depends_on: &airflow-deps
     postgres:
       condition: service_healthy
