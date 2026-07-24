@@ -7,10 +7,9 @@ results through a dimensional data mart.
 Built with **Airflow 3**, **PostgreSQL**, **AWS S3**, and **RDKit**, deployed locally via
 `docker-compose`.
 
-> **Status.** All data stages are built and verified end-to-end on real ChEMBL 35 data:
-> ingestion, source resolution, fingerprints, similarity, DWH load, and the analytical views.
-> Remaining: wiring the DAG tasks to the real containers and the Teams notification payload.
-> See §13 for the full status table.
+> **Status.** Complete and verified end-to-end on real ChEMBL 35 data: ingestion, source
+> resolution, fingerprints, similarity, DWH load, analytical views, and the Airflow DAG running
+> every stage in its own container. See §14 for the full status table.
 
 ---
 
@@ -123,6 +122,11 @@ rather than solving an observed problem — stated plainly rather than overclaim
 `source_molecule_key`, `target_molecule_key`, `tanimoto_score`,
 `has_duplicates_of_last_largest_score`. Invariant: `count = N_sources × 10`.
 
+The tie flag marks **only the boundary rows inside the top-10** — those whose score equals the
+10th-place score, and only when further molecules outside the top-10 share it. It does not mark
+the whole top-10, and the spilled-over molecules are not stored separately (they remain in the
+full per-source table). Confirmed with the mentor.
+
 Schema-level guarantees rather than code-only ones: `CHECK` constraints keep `tanimoto_score`
 within [0,1] and forbid self-similarity rows; the PK forbids a target appearing twice in one
 source's top-10.
@@ -203,10 +207,11 @@ Current input (5 CSVs, 58 rows):
 
 ### Fingerprints
 
-2,474,576 fingerprints across 16 partitions, ~25 s per partition (~7 min for the full corpus,
-sequential). **14 SMILES out of 2.47M (0.0006%) could not be parsed by RDKit** and are excluded;
-they are counted in each partition's reconciliation manifest (`structures_in` vs
-`fingerprints_out`) rather than silently dropped.
+2,474,576 fingerprints across 16 partitions, ~25 s per partition (measured end-to-end: read +
+RDKit + parquet write + S3 upload). With four partitions running at once the whole corpus is
+fingerprinted in a few minutes. **14 SMILES out of 2.47M (0.0006%) could not be parsed by
+RDKit** and are excluded; they are counted in each partition's reconciliation manifest
+(`structures_in` vs `fingerprints_out`) rather than silently dropped.
 
 ### Similarity
 
@@ -240,6 +245,29 @@ citalopram / escitalopram. This is expected behaviour for structural similarity 
 defect — and it is precisely why self-matches are excluded **by `chembl_id`, not by
 `score = 1.0`**: the latter would have discarded 71 legitimate nearest neighbours.
 
+### Worked example: Aspirin
+
+The clearest evidence that the results are chemically meaningful, not merely self-consistent.
+Searching 2,474,576 molecules for the neighbours of **CHEMBL25 (Aspirin)** returns:
+
+| Score | ChEMBL ID | Name | Structure |
+|-------|-----------|------|-----------|
+| 0.8889 | CHEMBL3833404 | Carbaspirin | two aspirin units co-crystallised with urea |
+| 0.8571 | CHEMBL350343 | Diplosalsalate | aspirin esterified with salicylic acid |
+| 0.7407 | CHEMBL5282669 | — | the carboxyl replaced by a ketone |
+| 0.7037 | CHEMBL4515737 | — | carbonate in place of the acetate |
+| 0.7000 | CHEMBL1451173 | Dipyrocetyl | the same scaffold bearing two acetate groups |
+| 0.6774 | CHEMBL163612 | Phenylaspirinate | phenyl ester of aspirin |
+| 0.6667 | CHEMBL1530334 | — | methyl carbonate of salicylic acid |
+| 0.6667 | CHEMBL163148 | — | methyl salicylate with an acetate |
+| 0.6552 | CHEMBL173216 | — | carbamate in place of the acetate |
+| 0.6452 | CHEMBL433917 | — | dimethyl carbamate |
+
+Every one of the ten is an aspirin derivative, ordered the way a chemist would expect: structures
+containing aspirin whole rank above single functional-group substitutions on its scaffold. Ranks
+7 and 8 share a score — a tie *inside* the top-10 — while the 10th score is unique, so nothing
+spills past the cut-off and the tie flag is correctly false throughout.
+
 ---
 
 ## 7. Project structure
@@ -255,8 +283,10 @@ tasks/
   dwh_load/               silver top-10 -> core star schema
 local_deployment/
   docker-compose.yml
+  Dockerfile.airflow          # stock Airflow + the docker provider
   migrations/{01_staging.sql, 02_core_star_schema.sql, 03_views.sql}
   init-dwh-db.sql
+e2e_verify.sh                 # cross-layer consistency check
 ```
 
 Each `tasks/*` folder is an independently containerised unit (`gen/{repository,services,
@@ -265,7 +295,66 @@ utils}.py` + `run.py`) with its own dependencies. Views are created by migration
 
 ---
 
-## 8. Prerequisites
+## 8. Orchestration
+
+The DAG (`dags/similarity_pipeline.py`) runs every stage as its own container via
+`DockerOperator`, so the containers described in §7 are the real unit of isolation rather than a
+claim: RDKit, `chembl_downloader` and `psycopg2` live only in the images that use them, and
+Airflow itself needs nothing but the docker provider.
+
+```
+acquire_chembl -> load_staging -> resolve_sources ---------> compute_similarity -> load_dwh
+                              \-> generate_fingerprints[16] /
+```
+
+Two things about the graph are deliberate:
+
+- **No separate ranking task.** `compute_similarity` produces the full per-source tables and the
+  top-10 with the tie flag in a single pass over the in-memory corpus. Splitting them would mean
+  loading 1.1 GB twice for no gain.
+- **Fingerprints are mapped, not looped.** One mapped task per corpus partition, so a failure
+  retries its own slice instead of the whole corpus, and progress is visible per partition.
+
+Because every stage is cache-aware, re-triggering a completed DAG skips finished work: a full
+warm run takes about two minutes, almost all of it in `load_staging` (the only stage without a
+cache, by design — it is a full refresh).
+
+### Runtime wiring, and two traps in it
+
+- **The docker provider is baked into a small custom image** (`Dockerfile.airflow`) instead of
+  being installed at container start. Installing it at runtime works only while the container
+  runs as the `airflow` user; the moment it runs as root — which reaching the docker socket may
+  require — pip refuses and the scheduler exits immediately.
+- **`~/.aws` is mounted read-write, not read-only.** Read-only looks safer and fails: botocore
+  writes refreshed SSO tokens back into `~/.aws/sso/cache`, so the first token renewal inside a
+  task container dies on a read-only filesystem.
+- Bind-mount sources are resolved by the **host** docker daemon, so `HOST_HOME` must be the host
+  path (e.g. `/Users/you`); expanding `~` inside the scheduler would yield `/home/airflow`.
+- Task containers join the compose network and reach Postgres as `postgres:5432`, not localhost.
+
+Failures post an Adaptive Card to Teams (`dags/callbacks.py`). The handler swallows its own
+errors: a broken webhook must never replace the exception that actually caused the failure.
+
+### Two things a fresh deployment needs
+
+Both were found by rebuilding from a clean clone against an empty database — a warm cache had
+been hiding them:
+
+- **Postgres needs a larger `/dev/shm`.** The compose file sets `shm_size: 1gb` on the postgres
+  service. Fingerprint partitions run a parallel hash join, and parallel workers exchange data
+  through shared memory; Docker's default 64 MB overflows when several partitions join at once,
+  failing with `could not resize shared memory segment`.
+- **The corpus is read in one shot, not streamed.** An earlier version used a server-side named
+  cursor to "stream" each partition; on a cold cache that forced an incremental plan and
+  round-tripped FETCH batches, turning a 1.4s join into 15+ minutes per partition. A partition
+  is only ~12 MB, so a plain fetch is both simpler and ~40x faster.
+
+The first cold run is still somewhat slower than subsequent ones — the staging tables are read
+from disk before the OS cache is warm — but partitions now complete in ~25s each, not minutes.
+
+---
+
+## 9. Prerequisites
 
 - Docker + docker-compose
 - AWS credentials for the course S3 bucket (`De-School-students` SSO profile, `eu-central-1`)
@@ -274,11 +363,22 @@ utils}.py` + `run.py`) with its own dependencies. Views are created by migration
 
 ---
 
-## 9. Setup & launch
+## 10. Setup & launch
 
 ```bash
+# 1. build the five task images the DAG runs, plus the Airflow image.
+# Names must match the DAG exactly — a missing image makes DockerOperator try to
+# pull it from a registry, which fails with a confusing "repository does not exist".
+docker build -t chembl-ingestion:latest              tasks/chembl_ingestion/
+docker build -t chembl-source-resolution:latest      tasks/source_resolution/
+docker build -t chembl-fingerprint-generation:latest tasks/fingerprint_generation/
+docker build -t chembl-similarity-computation:latest tasks/similarity_computation/
+docker build -t chembl-dwh-load:latest               tasks/dwh_load/
+docker build -f local_deployment/Dockerfile.airflow -t chembl-airflow:3.2.0 local_deployment/
+
+# 2. start the stack
 cd local_deployment
-cp .env.example .env          # set CHEMBL_RELEASE=35 and the Airflow image tag
+cp .env.example .env          # set HOST_HOME to your host home directory
 docker-compose up -d          # migrations create staging + core schemas and views
 ```
 
@@ -311,7 +411,7 @@ failure until fixed):
 
 ---
 
-## 10. Running the stages manually
+## 11. Running the stages manually
 
 ```bash
 export CHEMBL_RELEASE=35 DE_SCHOOL_S3_BUCKET=de-school-educational-data
@@ -342,7 +442,7 @@ Every stage is idempotent: re-running a completed stage is a cache hit, not repe
 
 ---
 
-## 11. Testing
+## 12. Testing
 
 ```bash
 cd tasks/<task> && pytest
@@ -364,7 +464,7 @@ top-10); cache paths; and the DWH referential-integrity guard.
 
 ---
 
-## 12. Key design decisions
+## 13. Key design decisions
 
 | # | Decision | Rationale |
 |---|----------|-----------|
@@ -386,12 +486,16 @@ top-10); cache paths; and the DWH referential-integrity guard.
 | Fact grain | Top-10 pairs only | Full 2.47M-row tables are step-4 evidence in S3; no view reads them |
 | Dimension | SCD Type 1 + surrogate key, facts-only scope | Static reference data; `chembl_id` not immutable; a dimension describes facts |
 | Pivot (8a) | Generic column slots + legend view | A view's columns are fixed at creation; hardcoding IDs breaks on new input, dynamic DDL moves schema into the pipeline |
+| Orchestration | DockerOperator per stage | Makes container-per-task real rather than documented; Airflow needs only the docker provider |
+| Airflow image | Provider baked into a custom image | Runtime install breaks outright when the container runs as root, and repeats on every boot |
+| Corpus read | Plain client-side fetch, not a server-side cursor | A named cursor forced an incremental plan and round-tripped FETCH batches — 15+ min/partition vs a 1.4s join; the slice is ~12 MB, so streaming saved nothing |
+| Postgres shm | `shm_size: 1gb` on the container | Parallel hash joins share memory via /dev/shm; Docker's 64 MB default overflows when several partitions join at once |
 | Isolation | READ COMMITTED (default) | Contention removed by design: parallel writes to distinct S3 keys; mart rebuilt in one transaction |
 | Not done | SCD2, incremental load, Spark, streaming, nested multiprocessing | Scope discipline; several were prototyped in design and dropped once measurement showed they bought nothing |
 
 ---
 
-## 13. Pipeline status
+## 14. Pipeline status
 
 | Stage | Task | Status |
 |-------|------|--------|
@@ -402,16 +506,18 @@ top-10); cache paths; and the DWH referential-integrity guard.
 | Tanimoto + top-10 + tie flag | `similarity_computation` | built, verified (560 rows) |
 | Load star schema | `dwh_load` | built, verified (615 dim / 560 facts) |
 | Analytical views (7a–8c) | `03_views.sql` | built, verified |
-| DAG wiring + Teams payload | `dags/` | pending |
+| DAG wiring + Teams payload | `dags/` | built, verified from the UI |
 
 ---
 
-## 14. Views
+## 15. Views
 
 All six live in `core` and are created by migration.
 
 - **`v_avg_similarity_per_source`** (7a) — mean/min/max Tanimoto per source.
-- **`v_avg_alogp_deviation`** (7b) — mean |alogp(neighbour) − alogp(source)|. `alogp` is not
+- **`v_avg_alogp_deviation`** (7b) — mean **absolute** deviation,
+  mean |alogp(neighbour) − alogp(source)|, which is the interpretation the mentor prefers: the
+  question is how far neighbours sit from the source, not in which direction. `alogp` is not
   universally populated, so a `comparable_neighbours` count reports how many pairs actually
   contributed instead of leaving the gap implicit.
 - **`v_pivot_source_legend`** + **`v_top10_pivot`** (8a) — the similarity matrix with ten
