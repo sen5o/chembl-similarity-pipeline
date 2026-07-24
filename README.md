@@ -207,10 +207,11 @@ Current input (5 CSVs, 58 rows):
 
 ### Fingerprints
 
-2,474,576 fingerprints across 16 partitions, ~25 s per partition (~7 min for the full corpus,
-sequential). **14 SMILES out of 2.47M (0.0006%) could not be parsed by RDKit** and are excluded;
-they are counted in each partition's reconciliation manifest (`structures_in` vs
-`fingerprints_out`) rather than silently dropped.
+2,474,576 fingerprints across 16 partitions, ~25 s per partition (measured end-to-end: read +
+RDKit + parquet write + S3 upload). With four partitions running at once the whole corpus is
+fingerprinted in a few minutes. **14 SMILES out of 2.47M (0.0006%) could not be parsed by
+RDKit** and are excluded; they are counted in each partition's reconciliation manifest
+(`structures_in` vs `fingerprints_out`) rather than silently dropped.
 
 ### Similarity
 
@@ -333,6 +334,23 @@ cache, by design — it is a full refresh).
 
 Failures post an Adaptive Card to Teams (`dags/callbacks.py`). The handler swallows its own
 errors: a broken webhook must never replace the exception that actually caused the failure.
+
+### Two things a fresh deployment needs
+
+Both were found by rebuilding from a clean clone against an empty database — a warm cache had
+been hiding them:
+
+- **Postgres needs a larger `/dev/shm`.** The compose file sets `shm_size: 1gb` on the postgres
+  service. Fingerprint partitions run a parallel hash join, and parallel workers exchange data
+  through shared memory; Docker's default 64 MB overflows when several partitions join at once,
+  failing with `could not resize shared memory segment`.
+- **The corpus is read in one shot, not streamed.** An earlier version used a server-side named
+  cursor to "stream" each partition; on a cold cache that forced an incremental plan and
+  round-tripped FETCH batches, turning a 1.4s join into 15+ minutes per partition. A partition
+  is only ~12 MB, so a plain fetch is both simpler and ~40x faster.
+
+The first cold run is still somewhat slower than subsequent ones — the staging tables are read
+from disk before the OS cache is warm — but partitions now complete in ~25s each, not minutes.
 
 ---
 
@@ -470,6 +488,8 @@ top-10); cache paths; and the DWH referential-integrity guard.
 | Pivot (8a) | Generic column slots + legend view | A view's columns are fixed at creation; hardcoding IDs breaks on new input, dynamic DDL moves schema into the pipeline |
 | Orchestration | DockerOperator per stage | Makes container-per-task real rather than documented; Airflow needs only the docker provider |
 | Airflow image | Provider baked into a custom image | Runtime install breaks outright when the container runs as root, and repeats on every boot |
+| Corpus read | Plain client-side fetch, not a server-side cursor | A named cursor forced an incremental plan and round-tripped FETCH batches — 15+ min/partition vs a 1.4s join; the slice is ~12 MB, so streaming saved nothing |
+| Postgres shm | `shm_size: 1gb` on the container | Parallel hash joins share memory via /dev/shm; Docker's 64 MB default overflows when several partitions join at once |
 | Isolation | READ COMMITTED (default) | Contention removed by design: parallel writes to distinct S3 keys; mart rebuilt in one transaction |
 | Not done | SCD2, incremental load, Spark, streaming, nested multiprocessing | Scope discipline; several were prototyped in design and dropped once measurement showed they bought nothing |
 

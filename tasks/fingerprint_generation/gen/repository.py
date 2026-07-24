@@ -44,20 +44,24 @@ _CORPUS_SQL = """
 
 
 def read_corpus_partition(dsn: str, part: int, partitions: int):
-    """Yield (chembl_id, molregno, canonical_smiles) for one partition.
+    """Return (chembl_id, molregno, canonical_smiles) rows for one partition.
 
-    Streams server-side via a named cursor so a ~155k-row slice never lands in
-    memory all at once (matters under the shared ~7.9 GB container budget).
+    Read in one shot with a plain client-side cursor, not a server-side named
+    cursor. A partition is ~155k rows (~12 MB) and the join itself runs in ~1.4s
+    (measured with EXPLAIN ANALYZE), so materialising it client-side is cheap.
+
+    A named cursor was tried first to "stream" the slice, but it forced Postgres
+    onto an incremental cursor plan and split the read into round-tripped FETCH
+    batches — turning a 1.4s join into 15+ minutes per partition. The memory it
+    saved (~12 MB) never mattered under the container budget; the slowdown did.
     """
     import psycopg2
 
     conn = psycopg2.connect(dsn)
     try:
-        # named cursor => server-side, batched fetches, not a full materialise
-        with conn.cursor(name=f"corpus_{part}") as cur:
-            cur.itersize = 20_000
+        with conn.cursor() as cur:
             cur.execute(_CORPUS_SQL, {"partitions": partitions, "part": part})
-            yield from cur
+            return cur.fetchall()
     finally:
         conn.close()
 

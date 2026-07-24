@@ -61,6 +61,7 @@ x-airflow-common: &airflow-common
 services:
   postgres:
     image: postgres:16
+    shm_size: 1gb
     environment:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
