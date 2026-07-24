@@ -38,7 +38,9 @@ TASK_ENV = {
     "INPUT_S3_PREFIX": os.environ.get("INPUT_S3_PREFIX", ""),
     "AWS_PROFILE": os.environ.get("AWS_PROFILE", ""),
     "AWS_REGION": os.environ.get("AWS_REGION", "eu-central-1"),
-    "DWH_DSN": os.environ.get("TASK_DWH_DSN", "postgresql://airflow:airflow@postgres:5432/dwh"),
+    "DWH_DSN": os.environ.get(
+        "TASK_DWH_DSN", "postgresql://airflow:airflow@postgres:5432/dwh"
+    ),
     "CORPUS_PARTITIONS": str(CORPUS_PARTITIONS),
 }
 
@@ -46,14 +48,14 @@ TASK_ENV = {
 DOCKER_NETWORK = os.environ.get("TASK_DOCKER_NETWORK", "local_deployment_default")
 
 # Host paths mounted into every task container:
-#   ~/.aws   - SSO credentials, read-only; tasks authenticate as the operator does
+#   ~/.aws   - SSO credentials; tasks authenticate as the operator does
 #   ~/.data  - chembl_downloader's cache, so a cold `acquire` doesn't re-download
 #              the multi-GB release dump on every container start
 HOST_HOME = os.environ.get("HOST_HOME", os.path.expanduser("~"))
 
 COMMON_MOUNTS = [
-    # Read-write: botocore writes refreshed SSO tokens back into ~/.aws/sso/cache,
-    # so a read-only mount fails the moment the token needs renewing.
+    # Read-write, not read-only: botocore writes refreshed SSO tokens back into
+    # ~/.aws/sso/cache, so a read-only mount dies on the first token renewal.
     Mount(source=f"{HOST_HOME}/.aws", target="/root/.aws", type="bind"),
     Mount(source=f"{HOST_HOME}/.data", target="/root/.data", type="bind"),
 ]
@@ -85,6 +87,13 @@ DEFAULT_ARGS = {
     default_args=DEFAULT_ARGS,
     tags=["chembl", "similarity", "capstone"],
     doc_md=__doc__,
+    # Memory and database contention bind here, not cores. Each fingerprint
+    # partition runs a three-table join over the unindexed staging tables, and
+    # sixteen of those at once — on a container budget of ~7.9 GB shared with
+    # Postgres and the Airflow services — stall instead of parallelising
+    # (observed: sixteen containers sitting at 0% CPU). Four at a time keeps
+    # every partition moving and finishes sooner than an unbounded fan-out.
+    max_active_tasks=4,
 )
 def similarity_pipeline():
     # --- Bronze ------------------------------------------------------------
